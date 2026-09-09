@@ -1,0 +1,6 @@
+[package]
+name = "plugin-abi"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]

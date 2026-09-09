@@ -1,0 +1,12 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/engine",
+    "crates/engine-cli",
+    "crates/plugin-abi",
+    "apps/desktop/src-tauri",
+]
+
+[workspace.package]
+version = "0.0.0"
+edition = "2021"

@@ -1,0 +1,13 @@
+{
+  "name": "revlog",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "dev:ui": "pnpm --filter ui-shell dev",
+    "build:ui": "pnpm --filter ui-shell build",
+    "test": "pnpm -r test"
+  }
+}
