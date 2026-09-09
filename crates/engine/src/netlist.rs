@@ -33,6 +33,10 @@ pub enum TemplateNode {
     Not,
     InputPin,
     OutputPin,
+    /// A weak source pulling its point to `Bit` when nothing else drives
+    /// it — see `Gate::PullResistor` for why it's wired in like a normal
+    /// driver but resolved specially.
+    PullResistor(Bit),
     /// Reference to another `CircuitTemplate` by name, resolved during
     /// `flatten`. As a connection endpoint, its pins are numbered
     /// `0..input_ports.len()` for inputs then `input_ports.len()..` for
@@ -160,6 +164,9 @@ fn expand(
             }
             TemplateNode::OutputPin => {
                 local_to_global.insert(local_idx, builder.add_gate(Gate::OutputPin { value: Bit::Zero }));
+            }
+            TemplateNode::PullResistor(to) => {
+                local_to_global.insert(local_idx, builder.add_gate(Gate::PullResistor { to: *to }));
             }
             TemplateNode::Subcircuit(sub_name) => {
                 let ports = expand(sub_name, library, builder, stack)?;

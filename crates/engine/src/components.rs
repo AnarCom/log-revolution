@@ -25,6 +25,15 @@ pub enum Gate {
     /// A sink: one input, no fanout of its own; `eval` just mirrors the
     /// input so `read("get")` can report it.
     OutputPin { value: Bit },
+    /// A weak source — pulls its point to `to` only when nothing else
+    /// drives it. Deliberately *not* just another entry in the normal
+    /// `combine` fold: it must lose to any real driver (even a lone
+    /// well-defined one) and must not paper over a real short circuit.
+    /// That two-phase rule lives in `sim.rs::gather_inputs`, matched
+    /// against `logisim-port`'s `CircuitWires.pullValue` — this variant
+    /// only carries the configured target (`to` can be `Error`: Logisim's
+    /// own "X" pull option, for "must not be left floating").
+    PullResistor { to: Bit },
 }
 
 impl Gate {
@@ -36,7 +45,7 @@ impl Gate {
     pub fn delay(&self) -> u64 {
         match self {
             Gate::And | Gate::Or | Gate::Not => 1,
-            Gate::InputPin { .. } | Gate::OutputPin { .. } => 0,
+            Gate::InputPin { .. } | Gate::OutputPin { .. } | Gate::PullResistor { .. } => 0,
         }
     }
 
@@ -53,7 +62,10 @@ impl Component for Gate {
     fn init(&mut self) {
         match self {
             Gate::InputPin { value } | Gate::OutputPin { value } => *value = Bit::Zero,
-            Gate::And | Gate::Or | Gate::Not => {}
+            // Not a runtime value to reset — `to` is the configured pull
+            // target, fixed for the instance's lifetime (an attribute in
+            // Logisim terms, not simulated state).
+            Gate::And | Gate::Or | Gate::Not | Gate::PullResistor { .. } => {}
         }
     }
 
@@ -61,13 +73,15 @@ impl Component for Gate {
         match self {
             Gate::And | Gate::Or => 2,
             Gate::Not | Gate::OutputPin { .. } => 1,
-            Gate::InputPin { .. } => 0,
+            // Real Logisim's `propagate` is a no-op for this too — it
+            // never reacts to anything, it's a constant.
+            Gate::InputPin { .. } | Gate::PullResistor { .. } => 0,
         }
     }
 
     fn output_count(&self) -> usize {
         match self {
-            Gate::And | Gate::Or | Gate::Not | Gate::InputPin { .. } => 1,
+            Gate::And | Gate::Or | Gate::Not | Gate::InputPin { .. } | Gate::PullResistor { .. } => 1,
             Gate::OutputPin { .. } => 0,
         }
     }
@@ -82,13 +96,15 @@ impl Component for Gate {
                 *value = Self::bit(&inputs[0]);
                 Vec::new()
             }
+            Gate::PullResistor { to } => vec![vec![*to]],
         }
     }
 
     fn serialize_state(&self) -> Vec<u8> {
         match self {
             Gate::InputPin { value } | Gate::OutputPin { value } => vec![bit_to_byte(*value)],
-            Gate::And | Gate::Or | Gate::Not => Vec::new(),
+            // `to` is configuration, not runtime state — nothing to persist.
+            Gate::And | Gate::Or | Gate::Not | Gate::PullResistor { .. } => Vec::new(),
         }
     }
 

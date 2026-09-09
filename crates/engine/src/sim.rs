@@ -72,19 +72,31 @@ impl Simulation {
         self.time
     }
 
-    /// One pin's value is the `combine` of *every* driver connected to it
+    /// One pin's value: `combine` every *real* driver connected to it
     /// (PLAN.md §9 — reproducing tri-state/short-circuit behavior, not just
-    /// "take the one source"). Zero drivers folds to `Unknown`, matching
-    /// an undriven point; two drivers disagreeing folds to `Error`.
+    /// "take the one source"); zero real drivers folds to `Unknown`, two
+    /// disagreeing ones fold to `Error`. `PullResistor` drivers are kept
+    /// out of that fold and applied afterward, only if the real-driver
+    /// result is `Unknown` — a lone well-defined driver or an actual
+    /// conflict both override the pull untouched. Mirrors
+    /// `CircuitWires.getThreadValue`/`pullValue` in `logisim-port`
+    /// exactly, not a simplification of it.
     fn gather_inputs(&self, gate: usize) -> Vec<Signal> {
         self.netlist.input_sources[gate]
             .iter()
             .map(|sources| {
-                let bit = sources
-                    .iter()
-                    .map(|(g, p)| self.outputs[*g][*p].first().copied().unwrap_or(Bit::Unknown))
-                    .fold(Bit::Unknown, Bit::combine);
-                vec![bit]
+                let mut real = Bit::Unknown;
+                let mut pull = Bit::Unknown;
+                for &(g, p) in sources {
+                    let v = self.outputs[g][p].first().copied().unwrap_or(Bit::Unknown);
+                    if matches!(self.netlist.gates[g], crate::components::Gate::PullResistor { .. }) {
+                        pull = pull.combine(v);
+                    } else {
+                        real = real.combine(v);
+                    }
+                }
+                let resolved = if real == Bit::Unknown { pull } else { real };
+                vec![resolved]
             })
             .collect()
     }
@@ -378,5 +390,92 @@ mod tests {
 
         assert_eq!(get_bit(&sim, 3), Bit::Zero);
         assert_eq!(get_bit(&sim, 7), Bit::One);
+    }
+
+    /// out is fed by a PullResistor(One) alone, or by an InputPin and a
+    /// PullResistor(One) together — exercises `pullValue`'s three real
+    /// branches (`logisim-port`'s `CircuitWires.java`).
+    fn pulled_output_circuit() -> CircuitTemplate {
+        CircuitTemplate {
+            name: "main".to_string(),
+            nodes: vec![
+                TemplateNode::InputPin,             // 0: driver (starts off)
+                TemplateNode::PullResistor(Bit::One), // 1: pull-up
+                TemplateNode::OutputPin,            // 2: out — fed by both
+            ],
+            connections: vec![((0, 0), (2, 0)), ((1, 0), (2, 0))],
+            input_ports: Vec::new(),
+            output_ports: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn pull_resistor_only_wins_when_nothing_else_drives() {
+        let mut library = HashMap::new();
+        library.insert("main".to_string(), pulled_output_circuit());
+        let netlist = flatten("main", &library).unwrap();
+        let mut sim = Simulation::new(netlist);
+
+        // Nothing real driving (InputPin defaults to Zero via `init`, but
+        // it's *connected* — so this isn't "no real driver": test that
+        // case with a lone pull separately, below).
+        sim.run_to_quiescence();
+        assert_eq!(get_bit(&sim, 2), Bit::Zero, "a real driver (even 0) beats the pull");
+
+        set(&mut sim, 0, true);
+        sim.run_to_quiescence();
+        assert_eq!(get_bit(&sim, 2), Bit::One, "real driver still wins, happens to agree with pull here");
+    }
+
+    #[test]
+    fn pull_resistor_fills_in_when_truly_unconnected() {
+        let mut library = HashMap::new();
+        // Same shape, but nothing connects to the InputPin's output — only
+        // the pull resistor drives `out`.
+        library.insert(
+            "main".to_string(),
+            CircuitTemplate {
+                name: "main".to_string(),
+                nodes: vec![TemplateNode::PullResistor(Bit::One), TemplateNode::OutputPin],
+                connections: vec![((0, 0), (1, 0))],
+                input_ports: Vec::new(),
+                output_ports: Vec::new(),
+            },
+        );
+        let netlist = flatten("main", &library).unwrap();
+        let mut sim = Simulation::new(netlist);
+        sim.run_to_quiescence();
+        assert_eq!(get_bit(&sim, 1), Bit::One);
+    }
+
+    #[test]
+    fn pull_resistor_does_not_mask_a_real_short_circuit() {
+        let mut library = HashMap::new();
+        library.insert(
+            "main".to_string(),
+            CircuitTemplate {
+                name: "main".to_string(),
+                nodes: vec![
+                    TemplateNode::InputPin,               // 0: a
+                    TemplateNode::InputPin,               // 1: b
+                    TemplateNode::PullResistor(Bit::One), // 2
+                    TemplateNode::OutputPin,              // 3: out
+                ],
+                connections: vec![((0, 0), (3, 0)), ((1, 0), (3, 0)), ((2, 0), (3, 0))],
+                input_ports: Vec::new(),
+                output_ports: Vec::new(),
+            },
+        );
+        let netlist = flatten("main", &library).unwrap();
+        let mut sim = Simulation::new(netlist);
+
+        set(&mut sim, 0, true);
+        set(&mut sim, 1, false);
+        sim.run_to_quiescence();
+        assert_eq!(
+            get_bit(&sim, 3),
+            Bit::Error,
+            "a real conflict stays an error, the pull resistor doesn't paper over it"
+        );
     }
 }
