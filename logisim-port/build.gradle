@@ -1,0 +1,53 @@
+plugins {
+    id 'java'
+    id 'application'
+}
+
+java {
+    toolchain {
+        languageVersion = JavaLanguageVersion.of(17)
+    }
+}
+
+// Standard src/main/java + src/main/resources layout — no custom sourceSets
+// needed. Note: src/main/resources/resources/... keeps the literal
+// "resources" folder the vendored code expects on the classpath (e.g.
+// LocaleManager("resources/logisim", ...), getResourceAsStream("resources/...")
+// ) — that's the original tree's own convention, kept as-is rather than
+// patching the vendored source.
+
+// Original source tree vendors its runtime deps as plain jars (no Maven repo
+// metadata) — see libs/. Wire them in directly instead of pretending they're
+// resolvable coordinates.
+dependencies {
+    implementation fileTree(dir: 'libs', include: ['*.jar'])
+}
+
+application {
+    mainClass = 'com.cburch.logisim.Main'
+}
+
+// Compiled *with* the JDK 17 toolchain above, but targeting the Java 8 API
+// surface (via javac --release, using its bundled ct.sym data) rather than
+// whatever the compiling JDK ships. Needed because a few Swing interfaces
+// (e.g. javax.swing.tree.TreeNode.children()) gained a generic signature in
+// a later JDK than this 2011 source predates — its overrides only satisfy
+// the pre-retrofit signature. This is a compatibility target, not a build
+// toolchain choice: nothing here runs on Java 8, we're just asking a modern
+// compiler to type-check against the older API this code was written for.
+tasks.withType(JavaCompile).configureEach {
+    options.release.set(8)
+}
+
+// The original build (scripts/create-jar.py) unpacks all vendored libs/*.jar
+// into one fat jar rather than shipping a classpath — matches that so the
+// output is a single portable jar, same as upstream's logisim-generic-*.jar.
+jar {
+    duplicatesStrategy = DuplicatesStrategy.EXCLUDE
+    manifest {
+        attributes 'Main-Class': 'com.cburch.logisim.Main'
+    }
+    from {
+        configurations.runtimeClasspath.collect { it.isDirectory() ? it : zipTree(it) }
+    }
+}

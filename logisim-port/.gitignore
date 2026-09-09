@@ -1,0 +1,9 @@
+# Gradle
+.gradle/
+build/
+!gradle/wrapper/gradle-wrapper.jar
+
+# IDE project files (java/gradle-specific; editor-wide ones are in the root .gitignore)
+.idea/
+*.iml
+out/

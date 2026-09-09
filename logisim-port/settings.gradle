@@ -1,0 +1,9 @@
+plugins {
+    // Resolves the JDK version requested by build.gradle's toolchain block
+    // (see java.toolchain.languageVersion) against locally installed JDKs,
+    // auto-downloading a matching one if none is found — so the build only
+    // ever needs to declare a version, never a machine-specific path.
+    id 'org.gradle.toolchains.foojay-resolver-convention' version '1.0.0'
+}
+
+rootProject.name = 'logisim-2.7.1'
