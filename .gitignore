@@ -1,0 +1,24 @@
+# OS
+.DS_Store
+Thumbs.db
+
+# Editors
+.vscode/
+.idea/
+*.swp
+
+# Node / pnpm (packages/, apps/)
+node_modules/
+dist/
+.vite/
+
+# Rust (crates/)
+target/
+# Cargo.lock committed: workspace ships binaries (engine-cli, desktop) — see PLAN.md §8
+
+# Tauri
+apps/desktop/src-tauri/target/
+
+# Logs
+*.log
+npm-debug.log*
