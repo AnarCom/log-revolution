@@ -43,6 +43,7 @@
 //! schema, not `.circ`, but matching Logisim's names now means the `.circ`
 //! importer (PLAN.md §9) won't need a translation table for them later.
 
+mod arithmetic;
 mod logic;
 mod memory;
 mod plexers;
@@ -82,6 +83,9 @@ pub enum CompileError {
     /// `attrs["disabled"]` isn't one of `Plexers.ATTR_DISABLED`'s two
     /// option strings (`"Z"`/`"0"`).
     InvalidDisabledOption { circuit: String, id: String, value: String },
+    /// `attrs["mode"]` for `core:Comparator` isn't one of `Comparator.java`'s
+    /// own two option strings (`"twosComplement"`/`"unsigned"`).
+    InvalidComparatorMode { circuit: String, id: String, value: String },
     /// `attrs["fanout"]` outside 1..=32 — `SplitterAttributes.ATTR_FANOUT`'s
     /// own range (`Attributes.forIntegerRange("fanout", .., 1, 32)`).
     InvalidFanout { circuit: String, id: String, value: i64 },
@@ -257,6 +261,7 @@ fn compile_leaf(type_: &str, circuit: &Circuit, comp: &ComponentInstance) -> Opt
         .or_else(|| wiring::compile(type_, circuit, comp))
         .or_else(|| memory::compile(type_, circuit, comp))
         .or_else(|| plexers::compile(type_, circuit, comp))
+        .or_else(|| arithmetic::compile(type_, circuit, comp))
 }
 
 /// `Value.MAX_WIDTH` — the upper bound for any pin's width, so also the

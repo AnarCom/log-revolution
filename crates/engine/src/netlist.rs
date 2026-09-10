@@ -62,6 +62,13 @@ pub enum TemplateNode {
     /// See `Gate::Demux`: input order is select, then `enable` if
     /// `has_enable`, then the one data line; `2^select_bits` outputs.
     Demux { bits: u8, select_bits: u8, has_enable: bool, disabled_zero: bool, tristate: bool },
+    /// See `Gate::Adder`: inputs `in0`, `in1`, `c_in`; outputs `sum`, `c_out`.
+    Adder { bits: u8 },
+    /// See `Gate::Subtractor`: inputs `in0`, `in1`, `b_in`; outputs `diff`,
+    /// `b_out`.
+    Subtractor { bits: u8 },
+    /// See `Gate::Comparator`: inputs `in0`, `in1`; outputs `gt`, `eq`, `lt`.
+    Comparator { bits: u8, signed: bool },
     /// Reference to another `CircuitTemplate` by name, resolved during
     /// `flatten`. As a connection endpoint, its pins are numbered
     /// `0..input_ports.len()` for inputs then `input_ports.len()..` for
@@ -114,6 +121,14 @@ impl TemplateNode {
                     *bits
                 }
             }
+            TemplateNode::Adder { bits } | TemplateNode::Subtractor { bits } => {
+                if pin < 2 {
+                    *bits
+                } else {
+                    1
+                }
+            }
+            TemplateNode::Comparator { bits, .. } => *bits,
             TemplateNode::Constant { .. }
             | TemplateNode::InputPin { .. }
             | TemplateNode::PullResistor(_)
@@ -123,7 +138,7 @@ impl TemplateNode {
     }
 
     /// Declared width of output pin `pin` — see `input_width`'s doc.
-    pub(crate) fn output_width(&self, _pin: usize) -> u8 {
+    pub(crate) fn output_width(&self, pin: usize) -> u8 {
         match self {
             TemplateNode::And { bits, .. }
             | TemplateNode::Or { bits, .. }
@@ -139,6 +154,14 @@ impl TemplateNode {
             TemplateNode::Clock { .. } => 1,
             TemplateNode::Register { bits, .. } => *bits,
             TemplateNode::Mux { bits, .. } | TemplateNode::Demux { bits, .. } => *bits,
+            TemplateNode::Adder { bits } | TemplateNode::Subtractor { bits } => {
+                if pin == 0 {
+                    *bits
+                } else {
+                    1
+                }
+            }
+            TemplateNode::Comparator { .. } => 1,
             TemplateNode::OutputPin { .. } => unreachable!("OutputPin has no output pins"),
             TemplateNode::Subcircuit(_) => unreachable!("Subcircuit width is resolved via the port-width table"),
         }
@@ -370,6 +393,15 @@ fn expand(
                         tristate: *tristate,
                     }),
                 );
+            }
+            TemplateNode::Adder { bits } => {
+                local_to_global.insert(local_idx, builder.add_gate(Gate::Adder { bits: *bits }));
+            }
+            TemplateNode::Subtractor { bits } => {
+                local_to_global.insert(local_idx, builder.add_gate(Gate::Subtractor { bits: *bits }));
+            }
+            TemplateNode::Comparator { bits, signed } => {
+                local_to_global.insert(local_idx, builder.add_gate(Gate::Comparator { bits: *bits, signed: *signed }));
             }
             TemplateNode::Subcircuit(sub_name) => {
                 let (ports, _) = expand(sub_name, library, builder, stack, false)?;
