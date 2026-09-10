@@ -29,7 +29,7 @@ mod memory;
 mod plexers;
 mod wiring;
 
-pub use memory::Trigger;
+pub use memory::{RamBus, Trigger};
 pub use wiring::ExtendMode;
 
 use plugin_abi::{ActionError, Bit, Component, ReadoutError, Signal, Value};
@@ -131,6 +131,44 @@ pub enum Gate {
     /// Output is always fully defined (`value` is a plain integer, never
     /// `Unknown`/`Error` itself).
     Register { bits: u8, trigger: Trigger, value: u32, last_clock: Bit },
+    /// `std/memory/Rom.java`: read-only, address-decoded storage.
+    /// `contents[addr]` (masked to `data_bits`) drives `data` whenever
+    /// `cs != Zero` and `addr` is fully defined — verified against
+    /// `propagate`: `!cs` drives `Unknown` outright; a *not-fully-defined*
+    /// `addr` (while still selected) does neither — `data` **holds**
+    /// whatever it last drove (`held_data`), mirroring Java's "return
+    /// without calling `setPort`" (no `setPort` call = the wire keeps
+    /// whatever value an earlier event already put there; our `eval`
+    /// always returns *something*, so `held_data` is that "something").
+    /// Input order: `addr`, `cs`; one output, `data`. Eagerly allocates
+    /// `1 << addr_bits` cells — fine at the small widths this engine's
+    /// been exercised with so far, a real concern at Logisim's own
+    /// ceiling (`addrWidth` up to 24 -> 64MB for a 32-bit-wide ROM); no
+    /// sparse/paged storage yet (real Logisim's own `MemContents` *does*
+    /// page precisely for this reason) — PLAN.md §14.
+    Rom { addr_bits: u8, data_bits: u8, contents: Vec<u32>, held_data: Signal },
+    /// `std/memory/Ram.java`: read/write address-decoded storage, gated by
+    /// `cs`/`oe`/`clr` plus a write path that depends on `bus`
+    /// (`RamBus::Combined`/`Asynch` share one shape — a single
+    /// bidirectional `data` pin doubles as the write source when `!oe`;
+    /// `Separate` instead has a dedicated `din` input and a `we` enable,
+    /// leaving `data` purely an output). `Combined` writes are edge-
+    /// triggered (`last_clock`, always `Trigger::Rising` — `Ram.java`
+    /// hardcodes `StdAttr.TRIG_RISING`, unlike `Register`'s configurable
+    /// four); `Asynch` writes happen combinationally, no clock pin
+    /// consulted at all. `clr` is a strict `== One` check (verified —
+    /// *not* `!= Zero` the way `cs`/`oe`/`we` are; an undriven/`Unknown`
+    /// `clr` must not clear) and always takes effect before the chip-
+    /// select gate, even when `!cs` — matches `propagate`'s own ordering.
+    /// A write with an undefined data value stores `mask32(data_bits)`
+    /// (all-ones), not an error or a no-op — `MemContents.set`'s `value &
+    /// mask` masks Java's own `toIntValue() == -1` sentinel the exact
+    /// same way a real `-1` would mask, verified in `MemContents.java`;
+    /// deliberately replicated, not "fixed", since nothing about it is a
+    /// bug — it's just what falls out of `-1`'s bit pattern surviving a
+    /// mask. Same held/hold-on-undefined-`addr` semantics as `Rom`, same
+    /// eager-allocation caveat.
+    Ram { addr_bits: u8, data_bits: u8, bus: RamBus, contents: Vec<u32>, last_clock: Bit, held_data: Signal },
     /// `std/plexers/Multiplexer.java`: routes one of `2^select_bits` data
     /// inputs (input order: data lines, then select, then `enable` if
     /// `has_enable`) to the single output, chosen by `select`. Stateless —
@@ -232,6 +270,20 @@ fn u32_to_signal(value: u32, bits: u8) -> Signal {
     (0..bits as usize).map(|i| if (value >> i) & 1 != 0 { Bit::One } else { Bit::Zero }).collect()
 }
 
+/// All `bits` low bits set — `MemContents.set`'s own `mask` field
+/// (`width == 32 ? 0xffffffff : (1 << width) - 1`, verified), needed by
+/// `Ram`'s write path. Written to avoid `1u32 << 32` overflow at the top
+/// of the valid width range, same shape as `compile::wiring::all_ones`
+/// (a separate copy, not shared — that one runs at compile time over a
+/// `ComponentInstance` attr, this one at eval time over a `Signal`).
+fn mask32(bits: u8) -> u32 {
+    if bits == 32 {
+        u32::MAX
+    } else {
+        (1u32 << bits) - 1
+    }
+}
+
 fn bit_to_byte(b: Bit) -> u8 {
     match b {
         Bit::Zero => 0,
@@ -283,6 +335,8 @@ impl Gate {
             // batch.
             | Gate::BitExtender { .. } => 1,
             Gate::Register { .. } => 8,
+            // `Mem.DELAY`, verified in `Mem.java` — shared by `Rom`/`Ram`.
+            Gate::Rom { .. } | Gate::Ram { .. } => 10,
             // `Plexers.DELAY`, verified in `Plexers.java`/`Decoder.java`/
             // `PriorityEncoder.java`.
             Gate::Mux { .. } | Gate::Demux { .. } | Gate::Decoder { .. } | Gate::PriorityEncoder { .. } => 3,
@@ -331,7 +385,7 @@ impl Gate {
     /// defined).
     pub fn input_width(&self, pin: usize) -> u8 {
         match self {
-            Gate::Clock { .. } | Gate::Register { .. } => self.input_width_memory(pin),
+            Gate::Clock { .. } | Gate::Register { .. } | Gate::Rom { .. } | Gate::Ram { .. } => self.input_width_memory(pin),
             Gate::Constant { .. }
             | Gate::InputPin { .. }
             | Gate::OutputPin { .. }
@@ -349,7 +403,7 @@ impl Gate {
     /// `fanout` entries.
     pub fn output_width(&self, pin: usize) -> u8 {
         match self {
-            Gate::Clock { .. } | Gate::Register { .. } => self.output_width_memory(pin),
+            Gate::Clock { .. } | Gate::Register { .. } | Gate::Rom { .. } | Gate::Ram { .. } => self.output_width_memory(pin),
             Gate::Constant { .. }
             | Gate::InputPin { .. }
             | Gate::OutputPin { .. }
@@ -366,7 +420,7 @@ impl Gate {
 impl Component for Gate {
     fn init(&mut self) {
         match self {
-            Gate::Clock { .. } | Gate::Register { .. } => self.init_memory(),
+            Gate::Clock { .. } | Gate::Register { .. } | Gate::Rom { .. } | Gate::Ram { .. } => self.init_memory(),
             Gate::Constant { .. } | Gate::InputPin { .. } | Gate::OutputPin { .. } | Gate::PullResistor { .. } | Gate::HexDigit { .. } => self.init_wiring(),
             // Logic gates carry no runtime state to reset — fixed at
             // instantiation (an attribute in Logisim terms), never
@@ -377,7 +431,7 @@ impl Component for Gate {
 
     fn input_count(&self) -> usize {
         match self {
-            Gate::Clock { .. } | Gate::Register { .. } => self.input_count_memory(),
+            Gate::Clock { .. } | Gate::Register { .. } | Gate::Rom { .. } | Gate::Ram { .. } => self.input_count_memory(),
             Gate::Constant { .. }
             | Gate::InputPin { .. }
             | Gate::OutputPin { .. }
@@ -405,7 +459,7 @@ impl Component for Gate {
 
     fn eval(&mut self, inputs: &[Signal]) -> Vec<Signal> {
         match self {
-            Gate::Clock { .. } | Gate::Register { .. } => self.eval_memory(inputs),
+            Gate::Clock { .. } | Gate::Register { .. } | Gate::Rom { .. } | Gate::Ram { .. } => self.eval_memory(inputs),
             Gate::Constant { .. }
             | Gate::InputPin { .. }
             | Gate::OutputPin { .. }
@@ -420,7 +474,7 @@ impl Component for Gate {
 
     fn serialize_state(&self) -> Vec<u8> {
         match self {
-            Gate::Clock { .. } | Gate::Register { .. } => self.serialize_memory(),
+            Gate::Clock { .. } | Gate::Register { .. } | Gate::Rom { .. } | Gate::Ram { .. } => self.serialize_memory(),
             Gate::InputPin { .. } | Gate::OutputPin { .. } | Gate::HexDigit { .. } => self.serialize_wiring(),
             // Configuration, not runtime state — nothing to persist.
             _ => Vec::new(),
@@ -429,7 +483,7 @@ impl Component for Gate {
 
     fn deserialize_state(&mut self, state: &[u8]) {
         match self {
-            Gate::Clock { .. } | Gate::Register { .. } => self.deserialize_memory(state),
+            Gate::Clock { .. } | Gate::Register { .. } | Gate::Rom { .. } | Gate::Ram { .. } => self.deserialize_memory(state),
             Gate::InputPin { .. } | Gate::OutputPin { .. } | Gate::HexDigit { .. } => self.deserialize_wiring(state),
             _ => {}
         }

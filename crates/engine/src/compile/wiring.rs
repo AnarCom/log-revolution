@@ -115,7 +115,7 @@ pub(super) fn compile(type_: &str, circuit: &Circuit, comp: &ComponentInstance) 
         "core:InputPin" => width_attr(circuit, comp).map(|bits| (TemplateNode::InputPin { bits }, source_geometry())),
         "core:OutputPin" => width_attr(circuit, comp).map(|bits| (TemplateNode::OutputPin { bits }, sink_geometry())),
         "core:PullResistor" => pull_target(circuit, comp).map(|to| (TemplateNode::PullResistor(to), source_geometry())),
-        "core:LED" => Ok((TemplateNode::OutputPin { bits: 1 }, sink_geometry())),
+        "core:Led" => Ok((TemplateNode::OutputPin { bits: 1 }, sink_geometry())),
         "core:Button" => Ok((TemplateNode::InputPin { bits: 1 }, source_geometry())),
         "core:BitExtender" => (|| {
             let in_bits = in_width_attr(circuit, comp)?;
@@ -243,7 +243,7 @@ mod tests {
     fn led_reflects_its_driven_input() {
         let project = single_circuit_project(Circuit {
             name: "main".to_string(),
-            components: vec![comp("in", "core:InputPin", 0, 0), comp("led", "core:LED", 3, 0)],
+            components: vec![comp("in", "core:InputPin", 0, 0), comp("led", "core:Led", 3, 0)],
             wires: vec![wire("w1", [0, 0], [3, 0])],
             annotations: vec![],
         });

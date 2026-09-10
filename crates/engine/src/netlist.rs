@@ -20,7 +20,7 @@
 //! usable whether or not the circuit they're in is ever used as a
 //! subcircuit.
 
-use crate::components::{ExtendMode, Gate, Trigger};
+use crate::components::{ExtendMode, Gate, RamBus, Trigger};
 use plugin_abi::Bit;
 use std::collections::HashMap;
 
@@ -64,6 +64,19 @@ pub enum TemplateNode {
     /// only through `Simulation::tick`.
     Clock { high: u64, low: u64 },
     Register { bits: u8, trigger: Trigger },
+    /// See `Gate::Rom`: input order is `addr`, `cs`; one output, `data`.
+    /// `contents`, length `1 << addr_bits`, is this template's own copy —
+    /// `expand` clones it fresh into every instantiated `Gate::Rom` (see
+    /// `sim::tests::subcircuit_instances_are_independent`'s guarantee,
+    /// which this relies on rather than re-proves: a `Rom`/`Ram` nested
+    /// inside a subcircuit used twice must not let one instance's writes
+    /// (`Ram`) or preloaded data (`Rom`) leak into the other's).
+    Rom { addr_bits: u8, data_bits: u8, contents: Vec<u32> },
+    /// See `Gate::Ram`: input order is `addr`, `cs`, `oe`, `clr`, `clk`,
+    /// then `data`(combined/asynch) or `we`, `din` (separate); one output,
+    /// `data`. Always starts blank (all-zero) — unlike `Rom`, real
+    /// Logisim's `Ram` has no settable initial-contents attribute either.
+    Ram { addr_bits: u8, data_bits: u8, bus: RamBus },
     /// See `Gate::Mux`: input order is data lines, then select, then
     /// `enable` if `has_enable`.
     Mux { bits: u8, select_bits: u8, has_enable: bool, disabled_zero: bool },
@@ -130,6 +143,20 @@ impl TemplateNode {
                     1
                 }
             }
+            TemplateNode::Rom { addr_bits, .. } => {
+                if pin == 0 {
+                    *addr_bits
+                } else {
+                    1
+                }
+            }
+            TemplateNode::Ram { addr_bits, data_bits, bus } => match pin {
+                0 => *addr_bits,
+                1..=4 => 1,
+                5 if *bus == RamBus::Separate => 1,
+                5 => *data_bits,
+                _ => *data_bits,
+            },
             TemplateNode::Mux { bits, select_bits, .. } => {
                 let n = 1usize << select_bits;
                 if pin < n {
@@ -204,6 +231,7 @@ impl TemplateNode {
             TemplateNode::PullResistor(_) => 1,
             TemplateNode::Clock { .. } => 1,
             TemplateNode::Register { bits, .. } => *bits,
+            TemplateNode::Rom { data_bits, .. } | TemplateNode::Ram { data_bits, .. } => *data_bits,
             TemplateNode::Mux { bits, .. } | TemplateNode::Demux { bits, .. } => *bits,
             TemplateNode::Decoder { .. } => 1,
             TemplateNode::PriorityEncoder { select_bits, .. } => {
@@ -440,6 +468,33 @@ fn expand(
                 local_to_global.insert(
                     local_idx,
                     builder.add_gate(Gate::Register { bits: *bits, trigger: *trigger, value: 0, last_clock: Bit::Zero }),
+                );
+            }
+            TemplateNode::Rom { addr_bits, data_bits, contents } => {
+                local_to_global.insert(
+                    local_idx,
+                    // `contents.clone()` — a fresh copy per instantiation,
+                    // see this variant's own doc comment for why that
+                    // matters (independent per subcircuit instance).
+                    builder.add_gate(Gate::Rom {
+                        addr_bits: *addr_bits,
+                        data_bits: *data_bits,
+                        contents: contents.clone(),
+                        held_data: vec![Bit::Zero; *data_bits as usize],
+                    }),
+                );
+            }
+            TemplateNode::Ram { addr_bits, data_bits, bus } => {
+                local_to_global.insert(
+                    local_idx,
+                    builder.add_gate(Gate::Ram {
+                        addr_bits: *addr_bits,
+                        data_bits: *data_bits,
+                        bus: *bus,
+                        contents: vec![0; 1usize << addr_bits],
+                        last_clock: Bit::Zero,
+                        held_data: vec![Bit::Zero; *data_bits as usize],
+                    }),
                 );
             }
             TemplateNode::Mux { bits, select_bits, has_enable, disabled_zero } => {

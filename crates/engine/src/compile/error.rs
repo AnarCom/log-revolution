@@ -46,4 +46,7 @@ pub enum CompileError {
     /// `attrs["type"]` for `core:BitExtender` isn't one of `BitExtender.
     /// java`'s own four option strings (`"zero"`/`"one"`/`"sign"`/`"input"`).
     InvalidExtendType { circuit: String, id: String, value: String },
+    /// `attrs["bus"]` for `core:Ram` isn't one of `Ram.java`'s own three
+    /// option strings (`"combined"`/`"asynch"`/`"separate"`).
+    InvalidRamBus { circuit: String, id: String, value: String },
 }

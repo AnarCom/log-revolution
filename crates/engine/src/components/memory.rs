@@ -1,10 +1,20 @@
-//! Clocked/stateful components: `Clock` and `Register`. See PLAN.md's
-//! "`Clock`/`Register` — один общий счётчик тактов" section for the full
-//! model (one shared tick counter, not independent timers) and the real
-//! bug it surfaced in `sim.rs`'s initial priming order.
+//! Clocked/stateful components: `Clock`/`Register`/`Rom`/`Ram`. See
+//! PLAN.md's "`Clock`/`Register` — один общий счётчик тактов" section for
+//! the full model (one shared tick counter, not independent timers) and
+//! the real bug it surfaced in `sim.rs`'s initial priming order.
 
-use super::{bit_to_byte, byte_to_bit, signal_to_u32_if_defined, u32_to_signal, Gate};
+use super::{bit_at, bit_to_byte, byte_to_bit, mask32, signal_to_u32_if_defined, u32_to_signal, zeros, Gate};
 use plugin_abi::{ActionError, Bit, ReadoutError, Signal, Value};
+
+/// `Ram.ATTR_BUS`'s three option strings (`"combined"`/`"asynch"`/
+/// `"separate"`) — see `Gate::Ram`'s doc comment for what each one means
+/// for the write path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RamBus {
+    Combined,
+    Asynch,
+    Separate,
+}
 
 /// `StdAttr.TRIGGER`'s four options, sames names as the JSON attribute
 /// values (`"rising"`/`"falling"`/`"high"`/`"low"`) — see `compile.rs`.
@@ -41,6 +51,20 @@ impl Gate {
                 *value = 0;
                 *last_clock = Bit::Zero; // matches memory `ClockState`'s initial `Value.FALSE`
             }
+            // `contents` is fixed configuration (an attribute in Logisim
+            // terms, loaded from `"contents"` at compile time), not
+            // simulated state — same treatment as `Constant`'s `value`
+            // (`wiring::init_wiring`'s doc comment) — only `held_data`
+            // (the currently-driven output) resets.
+            Gate::Rom { data_bits, held_data, .. } => *held_data = zeros(*data_bits),
+            // Unlike `Rom`, `contents` genuinely is simulated state here
+            // (writable memory) — resets to all-zero, matching a real
+            // power-on/fresh-simulation `Register`-style reset.
+            Gate::Ram { data_bits, contents, last_clock, held_data, .. } => {
+                contents.fill(0);
+                *last_clock = Bit::Zero;
+                *held_data = zeros(*data_bits);
+            }
             _ => unreachable!("dispatch bug: not a memory gate"),
         }
     }
@@ -51,6 +75,17 @@ impl Gate {
             // register geometry and `eval_memory` below both key off of.
             Gate::Register { .. } => 4,
             Gate::Clock { .. } => 0,
+            Gate::Rom { .. } => 2, // addr, cs
+            // addr, cs, oe, clr, clk, we, din — `Separate` alone gets a
+            // dedicated write pair; `clk` is always reserved (even for
+            // `Asynch`, which never reads it) so every non-`Separate` mode
+            // shares one shape rather than branching pin *counts* on top
+            // of pin *meanings*.
+            Gate::Ram { bus: RamBus::Separate, .. } => 7,
+            // addr, cs, oe, clr, clk, data_in — `Combined`/`Asynch` share
+            // this shape; `data_in` senses the bidirectional bus itself
+            // (there's no separate write pin without `Separate`).
+            Gate::Ram { .. } => 6,
             _ => unreachable!("dispatch bug: not a memory gate"),
         }
     }
@@ -60,6 +95,20 @@ impl Gate {
     pub(super) fn input_width_memory(&self, pin: usize) -> u8 {
         match self {
             Gate::Register { bits, .. } => if pin == 0 { *bits } else { 1 },
+            Gate::Rom { addr_bits, .. } => {
+                if pin == 0 {
+                    *addr_bits
+                } else {
+                    1 // cs
+                }
+            }
+            Gate::Ram { addr_bits, data_bits, bus, .. } => match pin {
+                0 => *addr_bits,
+                1..=4 => 1, // cs, oe, clr, clk
+                5 if *bus == RamBus::Separate => 1, // we
+                5 => *data_bits,                    // data_in (combined/asynch)
+                _ => *data_bits,                    // din (separate, pin 6)
+            },
             _ => unreachable!("dispatch bug: not a memory gate with inputs"),
         }
     }
@@ -68,6 +117,7 @@ impl Gate {
         match self {
             Gate::Clock { .. } => 1,
             Gate::Register { bits, .. } => *bits,
+            Gate::Rom { data_bits, .. } | Gate::Ram { data_bits, .. } => *data_bits,
             _ => unreachable!("dispatch bug: not a memory gate"),
         }
     }
@@ -97,6 +147,78 @@ impl Gate {
 
                 vec![u32_to_signal(*value, *bits)]
             }
+            Gate::Rom { addr_bits, data_bits, contents, held_data } => {
+                let cs = bit_at(&inputs[1], 0);
+                // `!chipSelect`: actively drives `Unknown`, distinct from
+                // the "hold" case below — verified in `Rom.propagate`.
+                if cs == Bit::Zero {
+                    *held_data = vec![Bit::Unknown; *data_bits as usize];
+                    return vec![held_data.clone()];
+                }
+                // A not-fully-defined `addr` (while still selected) drives
+                // *nothing* in Java (`return` with no `setPort` call) —
+                // `held_data` simply isn't touched, so it keeps re-emitting
+                // whatever it last drove.
+                if let Some(addr) = signal_to_u32_if_defined(&inputs[0], *addr_bits) {
+                    *held_data = u32_to_signal(contents[addr as usize], *data_bits);
+                }
+                vec![held_data.clone()]
+            }
+            Gate::Ram { addr_bits, data_bits, bus, contents, last_clock, held_data } => {
+                let cs = bit_at(&inputs[1], 0);
+                let oe = bit_at(&inputs[2], 0);
+                let clr = bit_at(&inputs[3], 0);
+                let ck = bit_at(&inputs[4], 0);
+                let separate = *bus == RamBus::Separate;
+
+                // Strict `== One` (verified — *not* `!= Zero` the way
+                // `cs`/`oe`/`we` are): an undriven/`Unknown` `clr` must not
+                // clear.
+                let should_clear = clr == Bit::One;
+                // `Asynch` writes combinationally (`triggered` unconditionally
+                // `true`, `Ram.propagate`'s `asynch ||`); otherwise a real
+                // rising edge, same `Trigger` mechanism as `Register`, just
+                // always `Rising` (`Ram.java` hardcodes `StdAttr.TRIG_RISING`).
+                let triggered = matches!(bus, RamBus::Asynch) || Trigger::Rising.fired(*last_clock, ck);
+                *last_clock = ck;
+
+                // Ordered exactly like `propagate`: the clear happens
+                // before the chip-select gate, so `clr` works even while
+                // `!cs`.
+                if should_clear {
+                    contents.fill(0);
+                }
+
+                let chip_select = cs != Bit::Zero;
+                if !chip_select {
+                    *held_data = vec![Bit::Unknown; *data_bits as usize];
+                    return vec![held_data.clone()];
+                }
+
+                let Some(addr) = signal_to_u32_if_defined(&inputs[0], *addr_bits) else {
+                    return vec![held_data.clone()]; // hold, same as `Rom`
+                };
+
+                let output_enabled = oe != Bit::Zero;
+                if !should_clear && triggered {
+                    let should_store = if separate { bit_at(&inputs[5], 0) != Bit::Zero } else { !output_enabled };
+                    if should_store {
+                        // `separate`: pin 6 (`din`); otherwise pin 5 doubles
+                        // as the sensed write value off the shared bus.
+                        let data_value = if separate { &inputs[6] } else { &inputs[5] };
+                        // An undefined write value stores `mask32(data_bits)`
+                        // (all-ones), not an error — see `Gate::Ram`'s doc
+                        // comment (`MemContents.set`'s `value & mask`
+                        // applied to Java's `toIntValue() == -1`).
+                        let raw = signal_to_u32_if_defined(data_value, *data_bits).unwrap_or(u32::MAX);
+                        contents[addr as usize] = raw & mask32(*data_bits);
+                    }
+                }
+
+                *held_data =
+                    if output_enabled { u32_to_signal(contents[addr as usize], *data_bits) } else { vec![Bit::Unknown; *data_bits as usize] };
+                vec![held_data.clone()]
+            }
             _ => unreachable!("dispatch bug: not a memory gate"),
         }
     }
@@ -113,6 +235,17 @@ impl Gate {
                 out.push(bit_to_byte(*last_clock));
                 out
             }
+            Gate::Rom { contents, held_data, .. } => {
+                let mut out: Vec<u8> = contents.iter().flat_map(|v| v.to_le_bytes()).collect();
+                out.extend(held_data.iter().copied().map(bit_to_byte));
+                out
+            }
+            Gate::Ram { contents, held_data, last_clock, .. } => {
+                let mut out: Vec<u8> = contents.iter().flat_map(|v| v.to_le_bytes()).collect();
+                out.extend(held_data.iter().copied().map(bit_to_byte));
+                out.push(bit_to_byte(*last_clock));
+                out
+            }
             _ => unreachable!("dispatch bug: not a memory gate"),
         }
     }
@@ -126,6 +259,23 @@ impl Gate {
             Gate::Register { value, last_clock, .. } => {
                 *value = state.get(0..4).and_then(|b| b.try_into().ok()).map(u32::from_le_bytes).unwrap_or(0);
                 *last_clock = state.get(4).copied().map(byte_to_bit).unwrap_or(Bit::Zero);
+            }
+            Gate::Rom { data_bits, contents, held_data, .. } => {
+                for (i, cell) in contents.iter_mut().enumerate() {
+                    let off = i * 4;
+                    *cell = state.get(off..off + 4).and_then(|b| b.try_into().ok()).map(u32::from_le_bytes).unwrap_or(0);
+                }
+                let held_off = contents.len() * 4;
+                *held_data = (0..*data_bits as usize).map(|i| state.get(held_off + i).copied().map(byte_to_bit).unwrap_or(Bit::Zero)).collect();
+            }
+            Gate::Ram { data_bits, contents, last_clock, held_data, .. } => {
+                for (i, cell) in contents.iter_mut().enumerate() {
+                    let off = i * 4;
+                    *cell = state.get(off..off + 4).and_then(|b| b.try_into().ok()).map(u32::from_le_bytes).unwrap_or(0);
+                }
+                let held_off = contents.len() * 4;
+                *held_data = (0..*data_bits as usize).map(|i| state.get(held_off + i).copied().map(byte_to_bit).unwrap_or(Bit::Zero)).collect();
+                *last_clock = state.get(held_off + *data_bits as usize).copied().map(byte_to_bit).unwrap_or(Bit::Zero);
             }
             _ => unreachable!("dispatch bug: not a memory gate"),
         }
@@ -333,5 +483,201 @@ mod tests {
         let mut r = register(4, Trigger::Rising);
         r.invoke("set", Some(Value::Int(0b1010))).unwrap();
         assert_eq!(r.read("get"), Ok(Value::Bits(vec![Bit::Zero, Bit::One, Bit::Zero, Bit::One])));
+    }
+
+    fn rom(addr_bits: u8, data_bits: u8, contents: Vec<u32>) -> Gate {
+        Gate::Rom { addr_bits, data_bits, contents, held_data: zeros(data_bits) }
+    }
+
+    fn rom_inputs(addr: &[Bit], cs: Bit) -> Vec<Signal> {
+        vec![addr.to_vec(), vec![cs]]
+    }
+
+    #[test]
+    fn rom_reads_the_addressed_cell_when_selected() {
+        let mut r = rom(2, 4, vec![0x1, 0xA, 0x3, 0xF]); // 4 cells, 2-bit address
+        // addr=1 (LSB-first: [1,0]) -> contents[1] = 0xA = 0b1010
+        let out = r.eval(&rom_inputs(&[Bit::One, Bit::Zero], Bit::One));
+        assert_eq!(out, vec![vec![Bit::Zero, Bit::One, Bit::Zero, Bit::One]]);
+    }
+
+    #[test]
+    fn rom_deselected_floats_actively_not_holds() {
+        let mut r = rom(2, 4, vec![0xF, 0xF, 0xF, 0xF]);
+        r.eval(&rom_inputs(&[Bit::One, Bit::Zero], Bit::One)); // select + read once
+        let out = r.eval(&rom_inputs(&[Bit::One, Bit::Zero], Bit::Zero)); // cs=0
+        assert_eq!(out, vec![vec![Bit::Unknown; 4]], "cs=0 actively drives Unknown, verified in Rom.propagate");
+    }
+
+    #[test]
+    fn rom_undefined_address_holds_the_previous_reading() {
+        let mut r = rom(2, 4, vec![0x1, 0xA, 0x3, 0xF]);
+        let first = r.eval(&rom_inputs(&[Bit::One, Bit::Zero], Bit::One)); // addr=1 -> 0xA
+        let held = r.eval(&rom_inputs(&[Bit::One, Bit::Unknown], Bit::One)); // addr now partially undefined
+        assert_eq!(held, first, "an undefined address while still selected must not drive a new (e.g. floating) value");
+    }
+
+    #[test]
+    fn rom_undriven_cs_defaults_to_selected() {
+        // `state.getPort(CS) != Value.FALSE` — Unknown counts as selected,
+        // same convention as Register's EN/Mux's enable.
+        let mut r = rom(2, 4, vec![0x1, 0xA, 0x3, 0xF]);
+        let out = r.eval(&rom_inputs(&[Bit::One, Bit::Zero], Bit::Unknown));
+        assert_eq!(out, vec![vec![Bit::Zero, Bit::One, Bit::Zero, Bit::One]]);
+    }
+
+    fn ram(bus: RamBus, addr_bits: u8, data_bits: u8) -> Gate {
+        Gate::Ram { addr_bits, data_bits, bus, contents: vec![0; 1usize << addr_bits], last_clock: Bit::Zero, held_data: zeros(data_bits) }
+    }
+
+    // combined/asynch: [addr, cs, oe, clr, clk, data]
+    fn ram_bus_inputs(addr: &[Bit], cs: Bit, oe: Bit, clr: Bit, clk: Bit, data: &[Bit]) -> Vec<Signal> {
+        vec![addr.to_vec(), vec![cs], vec![oe], vec![clr], vec![clk], data.to_vec()]
+    }
+
+    #[test]
+    fn ram_combined_write_on_rising_edge_then_read_back() {
+        let mut r = ram(RamBus::Combined, 2, 4);
+        let addr = [Bit::One, Bit::Zero]; // addr=1
+        let data = [Bit::One, Bit::One, Bit::Zero, Bit::Zero]; // 0b0011
+
+        // Write mode: oe=0 means "not reading" -> sensed DATA line is stored
+        // on the rising edge. Clock starts low first so the next eval is a
+        // real edge, not an already-high level.
+        r.eval(&ram_bus_inputs(&addr, Bit::One, Bit::Zero, Bit::Zero, Bit::Zero, &data));
+        r.eval(&ram_bus_inputs(&addr, Bit::One, Bit::Zero, Bit::Zero, Bit::One, &data));
+
+        // Now read it back: oe=1.
+        let out = r.eval(&ram_bus_inputs(&addr, Bit::One, Bit::One, Bit::Zero, Bit::One, &zeros(4)));
+        assert_eq!(out, vec![data.to_vec()]);
+    }
+
+    #[test]
+    fn ram_combined_write_needs_a_real_edge_not_just_a_high_level() {
+        let mut r = ram(RamBus::Combined, 2, 4);
+        let addr = [Bit::One, Bit::Zero];
+        let data = [Bit::One; 4];
+        let other = [Bit::Zero; 4];
+
+        r.eval(&ram_bus_inputs(&addr, Bit::One, Bit::Zero, Bit::Zero, Bit::Zero, &other)); // clk=0: establishes the low baseline, not yet triggered
+        r.eval(&ram_bus_inputs(&addr, Bit::One, Bit::Zero, Bit::Zero, Bit::One, &data)); // clk 0->1: a real edge, writes `data`
+        // clk stays high with different data on the bus: no *new* edge, must not re-write.
+        r.eval(&ram_bus_inputs(&addr, Bit::One, Bit::Zero, Bit::Zero, Bit::One, &other));
+
+        let out = r.eval(&ram_bus_inputs(&addr, Bit::One, Bit::One, Bit::Zero, Bit::One, &zeros(4))); // read back
+        assert_eq!(out, vec![data.to_vec()], "clock held high (no new edge) must not have re-triggered a write");
+    }
+
+    #[test]
+    fn ram_asynch_writes_without_needing_any_clock_edge() {
+        let mut r = ram(RamBus::Asynch, 2, 4);
+        let addr = [Bit::One, Bit::Zero];
+        let data = [Bit::Zero, Bit::One, Bit::One, Bit::Zero];
+
+        // clk held at Zero throughout (no edge at all) — still writes,
+        // since `triggered` is unconditionally true for `Asynch`.
+        r.eval(&ram_bus_inputs(&addr, Bit::One, Bit::Zero, Bit::Zero, Bit::Zero, &data));
+        let out = r.eval(&ram_bus_inputs(&addr, Bit::One, Bit::One, Bit::Zero, Bit::Zero, &zeros(4)));
+        assert_eq!(out, vec![data.to_vec()]);
+    }
+
+    #[test]
+    fn ram_deselected_floats_actively_not_holds() {
+        let mut r = ram(RamBus::Combined, 2, 4);
+        let addr = [Bit::One, Bit::Zero];
+        let data = [Bit::One; 4];
+        r.eval(&ram_bus_inputs(&addr, Bit::One, Bit::Zero, Bit::Zero, Bit::Zero, &data));
+        r.eval(&ram_bus_inputs(&addr, Bit::One, Bit::Zero, Bit::Zero, Bit::One, &data)); // write
+
+        let out = r.eval(&ram_bus_inputs(&addr, Bit::Zero, Bit::One, Bit::Zero, Bit::One, &zeros(4))); // cs=0
+        assert_eq!(out, vec![vec![Bit::Unknown; 4]]);
+    }
+
+    #[test]
+    fn ram_undefined_address_holds_the_previous_reading() {
+        let mut r = ram(RamBus::Combined, 2, 4);
+        let addr = [Bit::One, Bit::Zero];
+        let data = [Bit::One, Bit::Zero, Bit::One, Bit::Zero];
+        r.eval(&ram_bus_inputs(&addr, Bit::One, Bit::Zero, Bit::Zero, Bit::Zero, &data));
+        r.eval(&ram_bus_inputs(&addr, Bit::One, Bit::Zero, Bit::Zero, Bit::One, &data)); // write
+        let first = r.eval(&ram_bus_inputs(&addr, Bit::One, Bit::One, Bit::Zero, Bit::One, &zeros(4))); // read
+
+        let bad_addr = [Bit::One, Bit::Unknown];
+        let held = r.eval(&ram_bus_inputs(&bad_addr, Bit::One, Bit::One, Bit::Zero, Bit::One, &zeros(4)));
+        assert_eq!(held, first);
+    }
+
+    /// `clr` is a strict `== One` check (verified in `Ram.propagate`) —
+    /// unlike `cs`/`oe`/`we`'s `!= Zero`, an undriven/`Unknown` `clr` must
+    /// NOT clear.
+    #[test]
+    fn ram_clear_is_strict_equality_unknown_does_not_clear() {
+        let mut r = ram(RamBus::Combined, 2, 4);
+        let addr = [Bit::One, Bit::Zero];
+        let data = [Bit::One; 4];
+        r.eval(&ram_bus_inputs(&addr, Bit::One, Bit::Zero, Bit::Zero, Bit::Zero, &data));
+        r.eval(&ram_bus_inputs(&addr, Bit::One, Bit::Zero, Bit::Zero, Bit::One, &data)); // write
+
+        // clr=Unknown: must not clear.
+        r.eval(&ram_bus_inputs(&addr, Bit::One, Bit::One, Bit::Unknown, Bit::One, &zeros(4)));
+        let out = r.eval(&ram_bus_inputs(&addr, Bit::One, Bit::One, Bit::Unknown, Bit::One, &zeros(4)));
+        assert_eq!(out, vec![data.to_vec()], "Unknown clr must not have cleared the cell");
+    }
+
+    #[test]
+    fn ram_clear_wins_even_while_deselected() {
+        let mut r = ram(RamBus::Combined, 2, 4);
+        let addr = [Bit::One, Bit::Zero];
+        let data = [Bit::One; 4];
+        r.eval(&ram_bus_inputs(&addr, Bit::One, Bit::Zero, Bit::Zero, Bit::Zero, &data));
+        r.eval(&ram_bus_inputs(&addr, Bit::One, Bit::Zero, Bit::Zero, Bit::One, &data)); // write
+
+        // cs=0 (deselected) but clr=1 — Java clears before the chip-select
+        // gate, so this must still wipe the cell.
+        r.eval(&ram_bus_inputs(&addr, Bit::Zero, Bit::One, Bit::One, Bit::One, &zeros(4)));
+        let out = r.eval(&ram_bus_inputs(&addr, Bit::One, Bit::One, Bit::Zero, Bit::One, &zeros(4)));
+        assert_eq!(out, vec![zeros(4)], "clear must have taken effect despite !cs");
+    }
+
+    #[test]
+    fn ram_write_with_undefined_data_stores_all_ones_not_an_error() {
+        let mut r = ram(RamBus::Asynch, 2, 4);
+        let addr = [Bit::One, Bit::Zero];
+        r.eval(&ram_bus_inputs(&addr, Bit::One, Bit::Zero, Bit::Zero, Bit::Zero, &[Bit::One, Bit::Unknown, Bit::Zero, Bit::Zero]));
+        let out = r.eval(&ram_bus_inputs(&addr, Bit::One, Bit::One, Bit::Zero, Bit::Zero, &zeros(4)));
+        assert_eq!(out, vec![vec![Bit::One; 4]], "MemContents.set masks toIntValue()'s -1 sentinel to all-ones");
+    }
+
+    // separate: [addr, cs, oe, clr, clk, we, din]
+    fn ram_separate_inputs(addr: &[Bit], cs: Bit, oe: Bit, clr: Bit, clk: Bit, we: Bit, din: &[Bit]) -> Vec<Signal> {
+        vec![addr.to_vec(), vec![cs], vec![oe], vec![clr], vec![clk], vec![we], din.to_vec()]
+    }
+
+    #[test]
+    fn ram_separate_bus_writes_via_din_we_not_the_data_line() {
+        let mut r = ram(RamBus::Separate, 2, 4);
+        let addr = [Bit::One, Bit::Zero];
+        let din = [Bit::Zero, Bit::One, Bit::Zero, Bit::One];
+
+        // oe=1 (would-be "read" mode in combined bus) but that no longer
+        // blocks writes here — `we` alone decides.
+        r.eval(&ram_separate_inputs(&addr, Bit::One, Bit::One, Bit::Zero, Bit::Zero, Bit::One, &din));
+        r.eval(&ram_separate_inputs(&addr, Bit::One, Bit::One, Bit::Zero, Bit::One, Bit::One, &din));
+
+        let out = r.eval(&ram_separate_inputs(&addr, Bit::One, Bit::One, Bit::Zero, Bit::One, Bit::Zero, &zeros(4)));
+        assert_eq!(out, vec![din.to_vec()]);
+    }
+
+    #[test]
+    fn ram_separate_bus_we_off_does_not_write() {
+        let mut r = ram(RamBus::Separate, 2, 4);
+        let addr = [Bit::One, Bit::Zero];
+        let din = [Bit::One; 4];
+
+        r.eval(&ram_separate_inputs(&addr, Bit::One, Bit::One, Bit::Zero, Bit::Zero, Bit::Zero, &din)); // we=0
+        r.eval(&ram_separate_inputs(&addr, Bit::One, Bit::One, Bit::Zero, Bit::One, Bit::Zero, &din)); // rising edge, still we=0
+
+        let out = r.eval(&ram_separate_inputs(&addr, Bit::One, Bit::One, Bit::Zero, Bit::One, Bit::Zero, &zeros(4)));
+        assert_eq!(out, vec![zeros(4)], "we=0 must not have written");
     }
 }
