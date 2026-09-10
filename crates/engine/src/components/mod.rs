@@ -96,6 +96,16 @@ pub enum Gate {
     /// `BitExtender.propagate`/`configurePorts`). Input order: `in`, then
     /// `extend` if `mode == Input`.
     BitExtender { in_bits: u8, out_bits: u8, mode: ExtendMode },
+    /// `std/io/HexDigit.java`: a pure sink (no output pins, like `LED`) —
+    /// decodes a 4-bit `digit` plus a 1-bit `dot` into an 8-bit "lit
+    /// segments" bitmask (`value`, `read("get")`-able), ported verbatim
+    /// from `propagate`'s lookup table + bit-reassignment (`wiring::
+    /// hex_digit_summary`). A `digit` that isn't fully defined (`Unknown`/
+    /// `Error` anywhere) always displays as a dash — `Value.toIntValue()`
+    /// returns `-1` for those, which misses every `case 0..15` and falls
+    /// to Java's own `default` branch; not per-bit error propagation.
+    /// Input order: `digit`, `dot`.
+    HexDigit { value: Signal },
     /// A square-wave source — but *not* its own independent timer. Real
     /// Logisim has exactly one global tick counter for the whole
     /// simulation (`Propagator.ticks`); every `Clock` instance is a pure
@@ -280,7 +290,10 @@ impl Gate {
             | Gate::OutputPin { .. }
             | Gate::PullResistor { .. }
             | Gate::Constant { .. }
-            | Gate::Clock { .. } => 0,
+            | Gate::Clock { .. }
+            // No output pins at all (a pure sink, like `OutputPin`) — this
+            // value is never actually consulted.
+            | Gate::HexDigit { .. } => 0,
             // `(width + 2) * Adder.PER_DELAY` (`PER_DELAY = 1`), verified in
             // `Adder.java`/`Comparator.java` — wider adders/comparators
             // settle slower, same as real ripple-carry hardware would.
@@ -319,9 +332,12 @@ impl Gate {
     pub fn input_width(&self, pin: usize) -> u8 {
         match self {
             Gate::Clock { .. } | Gate::Register { .. } => self.input_width_memory(pin),
-            Gate::Constant { .. } | Gate::InputPin { .. } | Gate::OutputPin { .. } | Gate::PullResistor { .. } | Gate::BitExtender { .. } => {
-                self.input_width_wiring(pin)
-            }
+            Gate::Constant { .. }
+            | Gate::InputPin { .. }
+            | Gate::OutputPin { .. }
+            | Gate::PullResistor { .. }
+            | Gate::BitExtender { .. }
+            | Gate::HexDigit { .. } => self.input_width_wiring(pin),
             Gate::Mux { .. } | Gate::Demux { .. } | Gate::Decoder { .. } | Gate::PriorityEncoder { .. } => self.input_width_plexers(pin),
             Gate::Adder { .. } | Gate::Subtractor { .. } | Gate::Comparator { .. } | Gate::Multiplier { .. } | Gate::Divider { .. } => self.input_width_arithmetic(pin),
             _ => self.input_width_logic(pin),
@@ -334,9 +350,12 @@ impl Gate {
     pub fn output_width(&self, pin: usize) -> u8 {
         match self {
             Gate::Clock { .. } | Gate::Register { .. } => self.output_width_memory(pin),
-            Gate::Constant { .. } | Gate::InputPin { .. } | Gate::OutputPin { .. } | Gate::PullResistor { .. } | Gate::BitExtender { .. } => {
-                self.output_width_wiring(pin)
-            }
+            Gate::Constant { .. }
+            | Gate::InputPin { .. }
+            | Gate::OutputPin { .. }
+            | Gate::PullResistor { .. }
+            | Gate::BitExtender { .. }
+            | Gate::HexDigit { .. } => self.output_width_wiring(pin),
             Gate::Mux { .. } | Gate::Demux { .. } | Gate::Decoder { .. } | Gate::PriorityEncoder { .. } => self.output_width_plexers(pin),
             Gate::Adder { .. } | Gate::Subtractor { .. } | Gate::Comparator { .. } | Gate::Multiplier { .. } | Gate::Divider { .. } => self.output_width_arithmetic(pin),
             _ => self.output_width_logic(pin),
@@ -348,7 +367,7 @@ impl Component for Gate {
     fn init(&mut self) {
         match self {
             Gate::Clock { .. } | Gate::Register { .. } => self.init_memory(),
-            Gate::Constant { .. } | Gate::InputPin { .. } | Gate::OutputPin { .. } | Gate::PullResistor { .. } => self.init_wiring(),
+            Gate::Constant { .. } | Gate::InputPin { .. } | Gate::OutputPin { .. } | Gate::PullResistor { .. } | Gate::HexDigit { .. } => self.init_wiring(),
             // Logic gates carry no runtime state to reset — fixed at
             // instantiation (an attribute in Logisim terms), never
             // simulated state.
@@ -359,9 +378,12 @@ impl Component for Gate {
     fn input_count(&self) -> usize {
         match self {
             Gate::Clock { .. } | Gate::Register { .. } => self.input_count_memory(),
-            Gate::Constant { .. } | Gate::InputPin { .. } | Gate::OutputPin { .. } | Gate::PullResistor { .. } | Gate::BitExtender { .. } => {
-                self.input_count_wiring()
-            }
+            Gate::Constant { .. }
+            | Gate::InputPin { .. }
+            | Gate::OutputPin { .. }
+            | Gate::PullResistor { .. }
+            | Gate::BitExtender { .. }
+            | Gate::HexDigit { .. } => self.input_count_wiring(),
             Gate::Mux { .. } | Gate::Demux { .. } | Gate::Decoder { .. } | Gate::PriorityEncoder { .. } => self.input_count_plexers(),
             Gate::Adder { .. } | Gate::Subtractor { .. } | Gate::Comparator { .. } | Gate::Multiplier { .. } | Gate::Divider { .. } => self.input_count_arithmetic(),
             _ => self.input_count_logic(),
@@ -370,7 +392,7 @@ impl Component for Gate {
 
     fn output_count(&self) -> usize {
         match self {
-            Gate::OutputPin { .. } => 0,
+            Gate::OutputPin { .. } | Gate::HexDigit { .. } => 0,
             // The only gate kinds with more than one output pin — everything
             // else (including `Mux`) is exactly 1.
             Gate::Demux { select_bits, .. } | Gate::Decoder { select_bits, .. } => 1usize << select_bits,
@@ -384,9 +406,12 @@ impl Component for Gate {
     fn eval(&mut self, inputs: &[Signal]) -> Vec<Signal> {
         match self {
             Gate::Clock { .. } | Gate::Register { .. } => self.eval_memory(inputs),
-            Gate::Constant { .. } | Gate::InputPin { .. } | Gate::OutputPin { .. } | Gate::PullResistor { .. } | Gate::BitExtender { .. } => {
-                self.eval_wiring(inputs)
-            }
+            Gate::Constant { .. }
+            | Gate::InputPin { .. }
+            | Gate::OutputPin { .. }
+            | Gate::PullResistor { .. }
+            | Gate::BitExtender { .. }
+            | Gate::HexDigit { .. } => self.eval_wiring(inputs),
             Gate::Mux { .. } | Gate::Demux { .. } | Gate::Decoder { .. } | Gate::PriorityEncoder { .. } => self.eval_plexers(inputs),
             Gate::Adder { .. } | Gate::Subtractor { .. } | Gate::Comparator { .. } | Gate::Multiplier { .. } | Gate::Divider { .. } => self.eval_arithmetic(inputs),
             _ => self.eval_logic(inputs),
@@ -396,7 +421,7 @@ impl Component for Gate {
     fn serialize_state(&self) -> Vec<u8> {
         match self {
             Gate::Clock { .. } | Gate::Register { .. } => self.serialize_memory(),
-            Gate::InputPin { .. } | Gate::OutputPin { .. } => self.serialize_wiring(),
+            Gate::InputPin { .. } | Gate::OutputPin { .. } | Gate::HexDigit { .. } => self.serialize_wiring(),
             // Configuration, not runtime state — nothing to persist.
             _ => Vec::new(),
         }
@@ -405,7 +430,7 @@ impl Component for Gate {
     fn deserialize_state(&mut self, state: &[u8]) {
         match self {
             Gate::Clock { .. } | Gate::Register { .. } => self.deserialize_memory(state),
-            Gate::InputPin { .. } | Gate::OutputPin { .. } => self.deserialize_wiring(state),
+            Gate::InputPin { .. } | Gate::OutputPin { .. } | Gate::HexDigit { .. } => self.deserialize_wiring(state),
             _ => {}
         }
     }
@@ -428,7 +453,7 @@ impl Component for Gate {
 
     fn readouts(&self) -> Vec<&'static str> {
         match self {
-            Gate::InputPin { .. } | Gate::OutputPin { .. } | Gate::Clock { .. } | Gate::Register { .. } => vec!["get"],
+            Gate::InputPin { .. } | Gate::OutputPin { .. } | Gate::Clock { .. } | Gate::Register { .. } | Gate::HexDigit { .. } => vec!["get"],
             _ => Vec::new(),
         }
     }
@@ -436,7 +461,7 @@ impl Component for Gate {
     fn read(&self, name: &str) -> Result<Value, ReadoutError> {
         match self {
             Gate::Clock { .. } | Gate::Register { .. } => self.read_memory(name),
-            Gate::InputPin { .. } | Gate::OutputPin { .. } => self.read_wiring(name),
+            Gate::InputPin { .. } | Gate::OutputPin { .. } | Gate::HexDigit { .. } => self.read_wiring(name),
             _ => Err(ReadoutError::UnknownReadout(name.to_string())),
         }
     }

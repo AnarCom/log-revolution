@@ -1,5 +1,5 @@
 //! Compiles the sources/sinks/pull resistor: Constant/InputPin/OutputPin/
-//! PullResistor/Ground/Power/LED/Button/BitExtender.
+//! PullResistor/Ground/Power/LED/Button/BitExtender/HexDigit.
 //!
 //! `Ground`/`Power` aren't their own runtime node kind — both are exactly a
 //! fixed-value source (`Ground.propagate`/`Power.propagate`, verified: each
@@ -99,6 +99,12 @@ fn bit_extender_geometry(has_extend_pin: bool) -> Geometry {
     Geometry { inputs, outputs: vec![(2, 0)] }
 }
 
+/// `digit` dead center, `dot` tucked at `(0, -2)` — matches `Gate::
+/// HexDigit`'s expected input order; no outputs, a pure sink.
+fn hex_digit_geometry() -> Geometry {
+    Geometry { inputs: vec![(0, 0), (0, -2)], outputs: vec![] }
+}
+
 pub(super) fn compile(type_: &str, circuit: &Circuit, comp: &ComponentInstance) -> Option<Result<(TemplateNode, Geometry), CompileError>> {
     Some(match type_ {
         "core:Constant" => {
@@ -117,6 +123,7 @@ pub(super) fn compile(type_: &str, circuit: &Circuit, comp: &ComponentInstance) 
             let mode = extend_mode_attr(circuit, comp)?;
             Ok((TemplateNode::BitExtender { in_bits, out_bits, mode }, bit_extender_geometry(mode == ExtendMode::Input)))
         })(),
+        "core:HexDigit" => Ok((TemplateNode::HexDigit, hex_digit_geometry())),
         _ => return None,
     })
 }
@@ -314,5 +321,34 @@ mod tests {
             vec![Bit::Zero, Bit::One, Bit::One, Bit::Zero, Bit::One, Bit::One, Bit::One, Bit::One],
             "low 4 bits are `data`, high 4 filled with `extend`'s current value"
         );
+    }
+
+    /// `digit`/`dot` -> `HexDigit`'s two inputs, placed to coincide exactly
+    /// with `hex_digit_geometry`'s offsets relative to the display at
+    /// `(0,0)`; no `OutputPin` at all (`HexDigit` has no outputs) — reads
+    /// its own `"get"` readout directly, same as `led_reflects_its_driven_
+    /// input` above.
+    #[test]
+    fn compiles_and_simulates_a_hex_digit_display() {
+        let mut w4 = BTreeMap::new();
+        w4.insert("width".to_string(), json!(4));
+        let project = single_circuit_project(Circuit {
+            name: "main".to_string(),
+            components: vec![
+                ComponentInstance { attrs: w4, ..comp("digit", "core:InputPin", 0, 0) },
+                comp("dot", "core:InputPin", 0, -2),
+                comp("disp", "core:HexDigit", 0, 0),
+            ],
+            wires: vec![wire("w1", [0, 0], [0, 0]), wire("w2", [0, -2], [0, -2])],
+            annotations: vec![],
+        });
+        let library = compile(&project).unwrap();
+        let netlist = flatten(&project.main_circuit, &library).unwrap();
+        let mut sim = Simulation::new(netlist);
+
+        sim.invoke(0, "set", Some(Value::Int(8))).unwrap(); // digit = 8, every segment lit
+        sim.invoke(1, "on", None).unwrap(); // dot = 1
+        sim.run_to_quiescence();
+        assert_eq!(get_bits(&sim, 2), vec![Bit::One; 8], "digit 8 + dot -> all 8 bits set");
     }
 }

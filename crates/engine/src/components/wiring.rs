@@ -1,7 +1,12 @@
 //! Sources, sinks, and the pull resistor: Constant/InputPin/OutputPin/
-//! PullResistor/BitExtender.
+//! PullResistor/BitExtender/HexDigit.
+//!
+//! `HexDigit`'s `value` is always 8 bits (`digit`'s 4 bits, `dot`'s 1 bit,
+//! and the 7-segment lookup below never touch anything past that) —
+//! unlike `InputPin`/`OutputPin`, whose width is configurable, so it has
+//! no `bits` field of its own and can't always share their match arms.
 
-use super::{bit_at, bit_to_byte, byte_to_bit, u32_to_signal, zeros, Gate};
+use super::{bit_at, bit_to_byte, byte_to_bit, signal_to_u32_if_defined, u32_to_signal, zeros, Gate};
 use plugin_abi::{ActionError, Bit, ReadoutError, Signal, Value};
 
 /// `BitExtender.java`'s `ATTR_TYPE` option (`"zero"`/`"one"`/`"sign"`/
@@ -20,6 +25,7 @@ impl Gate {
     pub(super) fn init_wiring(&mut self) {
         match self {
             Gate::InputPin { bits, value } | Gate::OutputPin { bits, value } => *value = zeros(*bits),
+            Gate::HexDigit { value } => *value = zeros(8),
             // Not runtime state to reset — fixed at instantiation (an
             // attribute in Logisim terms, not simulated state).
             Gate::Constant { .. } | Gate::PullResistor { .. } | Gate::BitExtender { .. } => {}
@@ -31,6 +37,7 @@ impl Gate {
         match self {
             Gate::OutputPin { .. } => 1,
             Gate::BitExtender { mode, .. } => 1 + (*mode == ExtendMode::Input) as usize,
+            Gate::HexDigit { .. } => 2, // digit, dot
             // Real Logisim's `propagate` is a no-op for these too — none of
             // them ever react to anything, they're all sources.
             Gate::InputPin { .. } | Gate::PullResistor { .. } | Gate::Constant { .. } => 0,
@@ -46,6 +53,13 @@ impl Gate {
                     *in_bits
                 } else {
                     1 // the optional `extend` control pin, `mode == Input` only
+                }
+            }
+            Gate::HexDigit { .. } => {
+                if pin == 0 {
+                    4 // digit
+                } else {
+                    1 // dot
                 }
             }
             _ => unreachable!("dispatch bug: not a wiring gate with an input"),
@@ -91,6 +105,12 @@ impl Gate {
                 let out: Signal = (0..*out_bits as usize).map(|i| if i < *in_bits as usize { bit_at(data, i) } else { fill }).collect();
                 vec![out]
             }
+            Gate::HexDigit { value } => {
+                let digit = &inputs[0];
+                let dot = bit_at(&inputs[1], 0);
+                *value = u32_to_signal(hex_digit_summary(digit, dot) as u32, 8);
+                Vec::new()
+            }
             _ => unreachable!("dispatch bug: not a wiring gate"),
         }
     }
@@ -100,14 +120,16 @@ impl Gate {
     /// return `Vec::new()` directly there, never routed here).
     pub(super) fn serialize_wiring(&self) -> Vec<u8> {
         match self {
-            Gate::InputPin { value, .. } | Gate::OutputPin { value, .. } => value.iter().copied().map(bit_to_byte).collect(),
-            _ => unreachable!("dispatch bug: not InputPin/OutputPin"),
+            Gate::InputPin { value, .. } | Gate::OutputPin { value, .. } | Gate::HexDigit { value } => value.iter().copied().map(bit_to_byte).collect(),
+            _ => unreachable!("dispatch bug: not InputPin/OutputPin/HexDigit"),
         }
     }
 
     pub(super) fn deserialize_wiring(&mut self, state: &[u8]) {
         if let Gate::InputPin { bits, value } | Gate::OutputPin { bits, value } = self {
             *value = (0..*bits as usize).map(|i| state.get(i).copied().map(byte_to_bit).unwrap_or(Bit::Zero)).collect();
+        } else if let Gate::HexDigit { value } = self {
+            *value = (0..8).map(|i| state.get(i).copied().map(byte_to_bit).unwrap_or(Bit::Zero)).collect();
         }
     }
 
@@ -165,10 +187,65 @@ impl Gate {
             // Bits, not Bool: collapsing to true/false would silently hide
             // Unknown/Error, which a `.ctest` assertion should be able to
             // see (PLAN.md §7).
-            (Gate::InputPin { value, .. } | Gate::OutputPin { value, .. }, "get") => Ok(Value::Bits(value.clone())),
+            (Gate::InputPin { value, .. } | Gate::OutputPin { value, .. } | Gate::HexDigit { value }, "get") => Ok(Value::Bits(value.clone())),
             (_, other) => Err(ReadoutError::UnknownReadout(other.to_string())),
         }
     }
+}
+
+/// `HexDigit.propagate`'s per-digit segment pattern, verified line-by-line
+/// (index = digit value 0-15; each hex nibble of the `u32` is one raw
+/// segment flag — see the Java source's own layout comment). Bit 4 (index
+/// 16 in the loop) is unused in every entry; kept anyway so the table
+/// matches the original literals exactly, not a hand-simplified version of
+/// them.
+const HEX_DIGIT_SEGMENTS: [u32; 16] = [
+    0x1110111, 0x0000011, 0x0111110, 0x0011111, 0x1001011, 0x1011101, 0x1111101, 0x0010011, 0x1111111, 0x1011011, 0x1111011, 0x1101101,
+    0x1110100, 0x0101111, 0x1111100, 0x1111000,
+];
+
+/// A digit outside 0-15 (not fully defined — see `Gate::HexDigit`'s doc
+/// comment) always displays as a dash, verified against `propagate`'s own
+/// `default` branch.
+const HEX_DIGIT_DASH: u32 = 0x0001000;
+
+/// `HexDigit.propagate`'s segment-flag -> summary-bit reassignment,
+/// verified line-by-line: the raw per-nibble flags above get remapped into
+/// a compact 8-bit "which of 7 segments + dot is lit" summary (bit
+/// meanings themselves are arbitrary — nothing renders this yet, only that
+/// they exactly mirror the Java source's mapping matters, so a future
+/// renderer needs no translation table of its own).
+fn hex_digit_summary(digit: &Signal, dot: Bit) -> u8 {
+    let segs = signal_to_u32_if_defined(digit, 4).map(|v| HEX_DIGIT_SEGMENTS[v as usize]).unwrap_or(HEX_DIGIT_DASH);
+    let mut summary = 0u8;
+    if segs & 0x1 != 0 {
+        summary |= 0b0000_0100;
+    }
+    if segs & 0x10 != 0 {
+        summary |= 0b0000_0010;
+    }
+    if segs & 0x100 != 0 {
+        summary |= 0b0000_1000;
+    }
+    if segs & 0x1000 != 0 {
+        summary |= 0b0100_0000;
+    }
+    if segs & 0x1_0000 != 0 {
+        summary |= 0b0000_0001;
+    }
+    if segs & 0x10_0000 != 0 {
+        summary |= 0b0001_0000;
+    }
+    if segs & 0x100_0000 != 0 {
+        summary |= 0b0010_0000;
+    }
+    // `state.getPort(1) == Value.TRUE` — a strict equality, not a
+    // truthiness test: `Error`/`Unknown` on `dot` leaves this bit unset,
+    // same as `Zero`.
+    if dot == Bit::One {
+        summary |= 0b1000_0000;
+    }
+    summary
 }
 
 #[cfg(test)]
@@ -257,5 +334,50 @@ mod tests {
         let mut e = Gate::BitExtender { in_bits: 4, out_bits: 2, mode: ExtendMode::One };
         let out = e.eval(&[four_bits(0b1011)]);
         assert_eq!(out, vec![vec![Bit::One, Bit::One]]);
+    }
+
+    /// `HexDigit` has no output pins — `eval` stores into `value`, read
+    /// back via `read("get")`, same access pattern as `OutputPin`/`LED`.
+    fn hex_digit_get(digit: u8, dot: Bit) -> Value {
+        let mut h = Gate::HexDigit { value: zeros(8) };
+        h.eval(&[four_bits(digit), vec![dot]]);
+        h.read("get").unwrap()
+    }
+
+    #[test]
+    fn hex_digit_zero_lights_every_segment_except_the_middle_bar() {
+        assert_eq!(hex_digit_get(0, Bit::Zero), Value::Bits(u32_to_signal(0x3F, 8)));
+    }
+
+    #[test]
+    fn hex_digit_one_lights_only_the_two_right_verticals() {
+        assert_eq!(hex_digit_get(1, Bit::Zero), Value::Bits(u32_to_signal(0b0000_0110, 8)));
+    }
+
+    #[test]
+    fn hex_digit_eight_lights_every_segment() {
+        assert_eq!(hex_digit_get(8, Bit::Zero), Value::Bits(u32_to_signal(0x7F, 8)));
+    }
+
+    #[test]
+    fn hex_digit_dot_sets_the_top_bit() {
+        assert_eq!(hex_digit_get(0, Bit::One), Value::Bits(u32_to_signal(0x3F | 0x80, 8)));
+    }
+
+    /// `Error`/`Unknown` on `dot` is not `One` — leaves the bit unset, same
+    /// as `Zero` (`state.getPort(1) == Value.TRUE` is a strict equality).
+    #[test]
+    fn hex_digit_dot_error_does_not_set_the_bit() {
+        assert_eq!(hex_digit_get(0, Bit::Error), Value::Bits(u32_to_signal(0x3F, 8)));
+    }
+
+    /// A `digit` outside 0-15 (not fully defined) always shows a dash —
+    /// only the middle bar — not per-bit error propagation into the
+    /// segments.
+    #[test]
+    fn hex_digit_undefined_value_displays_as_a_dash() {
+        let mut h = Gate::HexDigit { value: zeros(8) };
+        h.eval(&[vec![Bit::Zero, Bit::One, Bit::Unknown, Bit::Zero], vec![Bit::Zero]]);
+        assert_eq!(h.read("get"), Ok(Value::Bits(u32_to_signal(0b0100_0000, 8))));
     }
 }

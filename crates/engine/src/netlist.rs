@@ -57,6 +57,8 @@ pub enum TemplateNode {
     /// See `Gate::BitExtender`: input order is `in`, then `extend` if
     /// `mode == Input`.
     BitExtender { in_bits: u8, out_bits: u8, mode: ExtendMode },
+    /// See `Gate::HexDigit`: input order is `digit`, `dot`; no outputs.
+    HexDigit,
     /// See `Gate::Clock`'s doc comment: `high`/`low` are the period
     /// attributes, not an independent timer — actual advancement happens
     /// only through `Simulation::tick`.
@@ -162,6 +164,13 @@ impl TemplateNode {
                     1
                 }
             }
+            TemplateNode::HexDigit => {
+                if pin == 0 {
+                    4
+                } else {
+                    1
+                }
+            }
             TemplateNode::Adder { bits } | TemplateNode::Subtractor { bits } => {
                 if pin < 2 {
                     *bits
@@ -215,6 +224,7 @@ impl TemplateNode {
             TemplateNode::Comparator { .. } => 1,
             TemplateNode::Multiplier { bits } | TemplateNode::Divider { bits } => *bits,
             TemplateNode::OutputPin { .. } => unreachable!("OutputPin has no output pins"),
+            TemplateNode::HexDigit => unreachable!("HexDigit has no output pins"),
             TemplateNode::Subcircuit(_) => unreachable!("Subcircuit width is resolved via the port-width table"),
         }
     }
@@ -416,6 +426,9 @@ fn expand(
             }
             TemplateNode::BitExtender { in_bits, out_bits, mode } => {
                 local_to_global.insert(local_idx, builder.add_gate(Gate::BitExtender { in_bits: *in_bits, out_bits: *out_bits, mode: *mode }));
+            }
+            TemplateNode::HexDigit => {
+                local_to_global.insert(local_idx, builder.add_gate(Gate::HexDigit { value: vec![Bit::Zero; 8] }));
             }
             TemplateNode::Clock { high, low } => {
                 local_to_global.insert(
