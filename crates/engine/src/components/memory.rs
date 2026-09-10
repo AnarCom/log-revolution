@@ -55,6 +55,23 @@ impl Gate {
         }
     }
 
+    /// d, ck, clr, en — same fixed order as `input_count_memory`; only `d`
+    /// is `bits` wide, the three control pins are always single-bit.
+    pub(super) fn input_width_memory(&self, pin: usize) -> u8 {
+        match self {
+            Gate::Register { bits, .. } => if pin == 0 { *bits } else { 1 },
+            _ => unreachable!("dispatch bug: not a memory gate with inputs"),
+        }
+    }
+
+    pub(super) fn output_width_memory(&self, _pin: usize) -> u8 {
+        match self {
+            Gate::Clock { .. } => 1,
+            Gate::Register { bits, .. } => *bits,
+            _ => unreachable!("dispatch bug: not a memory gate"),
+        }
+    }
+
     pub(super) fn eval_memory(&mut self, inputs: &[Signal]) -> Vec<Signal> {
         match self {
             // Never recomputed from `inputs` — only `Gate::tick` (driven by

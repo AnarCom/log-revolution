@@ -5,25 +5,40 @@
 //! Wires connect by coordinate, same as `.circ` (PLAN.md §9's wire-segment
 //! decision): a component's pins have fixed positions relative to its own
 //! `x`/`y` (rotated by `facing`), and two points electrically connect iff
-//! they coincide. A union-find over every pin position and wire endpoint
-//! turns that into groups ("nets"); each net's output-direction pins
-//! become drivers of every input-direction pin in the same net — which is
-//! just `CircuitTemplate.connections` as an all-pairs product, nothing the
-//! rest of the engine doesn't already handle (short circuits included).
+//! they coincide. But the unit of connectivity is a *bit lane*
+//! (`(Point, bit index)`), not a whole pin — a `Splitter` fuses specific
+//! bits of its combined pin to specific (arbitrarily remapped) bits of each
+//! fanout pin, exactly the way real Logisim's own `Splitter` does (it isn't
+//! a simulated component at all — `Splitter.propagate` is a no-op, the
+//! fusion happens once, structurally, in `CircuitWires`'s "unite threads
+//! going through splitters" pass; `compile/splitter.rs` mirrors that: it
+//! returns a `SplitterWiring`, consumed only by the union-find below, never
+//! becoming a `TemplateNode`/`Gate`). A union-find over every pin's bit
+//! lanes and wire endpoints (all 32 lanes, always — see `compile_circuit`)
+//! turns that into groups ("nets"); each net's output-direction bits become
+//! drivers of every input-direction bit in the same net — which is just
+//! `CircuitTemplate.connections` as an all-pairs product, nothing the rest
+//! of the engine doesn't already handle (short circuits included). Ordinary
+//! (non-`Splitter`) wiring is bit-addressed too, uniformly, rather than
+//! carrying two parallel representations.
+//!
 //! That resolution (this file) is generic across every component kind, so
 //! it stays here; per-category attribute parsing/geometry/tests live in
-//! this module's `logic`/`wiring`/`memory` submodules (mirroring
-//! `components/`'s split, same rationale) — `compile_circuit` below just
-//! tries each category's `compile(type_, ..)` in turn until one claims the
-//! type string, same shape as `components::mod`'s trait dispatch but keyed
-//! by string instead of by enum variant (there's no single enum to match on
-//! here, `type_` is still a raw `&str` at this point).
+//! this module's `logic`/`wiring`/`memory`/`plexers`/`splitter` submodules
+//! (mirroring `components/`'s split, same rationale) — `compile_leaf`
+//! below just tries each category's `compile(type_, ..)` in turn until one
+//! claims the type string, same shape as `components::mod`'s trait dispatch
+//! but keyed by string instead of by enum variant (there's no single enum
+//! to match on here, `type_` is still a raw `&str` at this point).
+//! `splitter` doesn't participate in that dispatch — it doesn't produce a
+//! `(TemplateNode, Geometry)` pair, so `compile_circuit` calls it directly.
 //!
 //! Component attribute keys (`"width"`, `"inputs"`, `"value"`, `"pull"`,
-//! `"highDuration"`/`"lowDuration"`, `"trigger"`) deliberately reuse real
-//! Logisim's own attribute names (`StdAttr.WIDTH` = `"width"`,
-//! `GateAttributes.ATTR_INPUTS` = `"inputs"`, `Constant.ATTR_VALUE` =
-//! `"value"`, `Clock.ATTR_HIGH`/`ATTR_LOW`, `StdAttr.TRIGGER`, verified in
+//! `"highDuration"`/`"lowDuration"`, `"trigger"`, `"incoming"`/`"fanout"`)
+//! deliberately reuse real Logisim's own attribute names (`StdAttr.WIDTH` =
+//! `"width"`, `GateAttributes.ATTR_INPUTS` = `"inputs"`, `Constant.
+//! ATTR_VALUE` = `"value"`, `Clock.ATTR_HIGH`/`ATTR_LOW`, `StdAttr.
+//! TRIGGER`, `SplitterAttributes.ATTR_WIDTH`/`ATTR_FANOUT`, verified in
 //! `logisim-port`) rather than inventing our own — this is our own JSON
 //! schema, not `.circ`, but matching Logisim's names now means the `.circ`
 //! importer (PLAN.md §9) won't need a translation table for them later.
@@ -31,11 +46,12 @@
 mod logic;
 mod memory;
 mod plexers;
+mod splitter;
 mod wiring;
 
 use crate::file_format::{Circuit, ComponentInstance, Facing, ProjectFile};
-use crate::netlist::{CircuitTemplate, PinRef, TemplateNode};
-use std::collections::HashMap;
+use crate::netlist::{BitRef, CircuitTemplate, TemplateNode};
+use std::collections::{HashMap, HashSet};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CompileError {
@@ -66,6 +82,13 @@ pub enum CompileError {
     /// `attrs["disabled"]` isn't one of `Plexers.ATTR_DISABLED`'s two
     /// option strings (`"Z"`/`"0"`).
     InvalidDisabledOption { circuit: String, id: String, value: String },
+    /// `attrs["fanout"]` outside 1..=32 — `SplitterAttributes.ATTR_FANOUT`'s
+    /// own range (`Attributes.forIntegerRange("fanout", .., 1, 32)`).
+    InvalidFanout { circuit: String, id: String, value: i64 },
+    /// `attrs["bits"]` (this schema's own encoding of `bit_end`, see
+    /// `compile/splitter.rs`) has the wrong length or an out-of-range
+    /// entry.
+    InvalidSplitterBits { circuit: String, id: String, reason: String },
 }
 
 type Point = (i32, i32);
@@ -124,9 +147,15 @@ fn rotate(offset: Point, facing: Facing) -> Point {
     }
 }
 
-/// Union-find over pin/wire-endpoint coordinates.
+/// A single electrical *bit lane*: bit `1` of a point coinciding with a
+/// 4-bit pin is a different lane than bit `0` there, and a `Splitter` can
+/// fuse it to an entirely different point's bit than an ordinary wire
+/// would — see this module's doc comment.
+type Lane = (Point, u8);
+
+/// Union-find over pin/wire-endpoint bit lanes.
 struct Dsu {
-    parent: HashMap<Point, Point>,
+    parent: HashMap<Lane, Lane>,
 }
 
 impl Dsu {
@@ -134,7 +163,7 @@ impl Dsu {
         Dsu { parent: HashMap::new() }
     }
 
-    fn find(&mut self, p: Point) -> Point {
+    fn find(&mut self, p: Lane) -> Lane {
         let parent = *self.parent.entry(p).or_insert(p);
         if parent == p {
             p
@@ -145,7 +174,7 @@ impl Dsu {
         }
     }
 
-    fn union(&mut self, a: Point, b: Point) {
+    fn union(&mut self, a: Lane, b: Lane) {
         let (ra, rb) = (self.find(a), self.find(b));
         if ra != rb {
             self.parent.insert(ra, rb);
@@ -185,9 +214,11 @@ fn width_attr(circuit: &Circuit, comp: &ComponentInstance) -> Result<u8, Compile
 /// Compiles every circuit in `project` into a `CircuitTemplate` library,
 /// keyed by circuit name — ready for `netlist::flatten(&project.main_circuit, ..)`.
 pub fn compile(project: &ProjectFile) -> Result<HashMap<String, CircuitTemplate>, CompileError> {
-    // Needed up front: a subcircuit instance's pin geometry depends on how
-    // many ports the *referenced* circuit exposes, and circuits can
-    // reference each other regardless of order in the file.
+    // Needed up front: a subcircuit instance's pin geometry (and, now, its
+    // per-pin *widths* — a `Splitter` on the parent side needs to know
+    // exactly how wide each boundary pin is) depends on the *referenced*
+    // circuit, and circuits can reference each other regardless of order in
+    // the file.
     let port_counts: HashMap<String, (usize, usize)> = project
         .circuits
         .iter()
@@ -198,9 +229,20 @@ pub fn compile(project: &ProjectFile) -> Result<HashMap<String, CircuitTemplate>
         })
         .collect();
 
+    let mut port_widths: HashMap<String, (Vec<u8>, Vec<u8>)> = HashMap::new();
+    for circuit in &project.circuits {
+        let widths_of = |type_: &str| -> Result<Vec<u8>, CompileError> {
+            port_component_ids(circuit, type_)
+                .into_iter()
+                .map(|id| width_attr(circuit, circuit.components.iter().find(|c| c.id == id).unwrap()))
+                .collect()
+        };
+        port_widths.insert(circuit.name.clone(), (widths_of("core:InputPin")?, widths_of("core:OutputPin")?));
+    }
+
     let mut library = HashMap::new();
     for circuit in &project.circuits {
-        library.insert(circuit.name.clone(), compile_circuit(circuit, &port_counts)?);
+        library.insert(circuit.name.clone(), compile_circuit(circuit, &port_counts, &port_widths)?);
     }
     Ok(library)
 }
@@ -217,28 +259,47 @@ fn compile_leaf(type_: &str, circuit: &Circuit, comp: &ComponentInstance) -> Opt
         .or_else(|| plexers::compile(type_, circuit, comp))
 }
 
+/// `Value.MAX_WIDTH` — the upper bound for any pin's width, so also the
+/// number of lanes worth unioning at any coincident pair of points. Wires
+/// (and `Splitter` ends) don't know in advance how wide the pins touching
+/// them are, so every wire unconditionally unions all 32; lanes no real pin
+/// ever registers just sit unqueried, harmless.
+const MAX_WIDTH: u8 = 32;
+
 fn compile_circuit(
     circuit: &Circuit,
     port_counts: &HashMap<String, (usize, usize)>,
+    port_widths: &HashMap<String, (Vec<u8>, Vec<u8>)>,
 ) -> Result<CircuitTemplate, CompileError> {
+    let mut seen_ids: HashSet<&str> = HashSet::new();
     let mut id_to_index: HashMap<&str, usize> = HashMap::new();
     let mut nodes = Vec::with_capacity(circuit.components.len());
-    let mut input_points: Vec<Vec<Point>> = Vec::with_capacity(circuit.components.len());
-    let mut output_points: Vec<Vec<Point>> = Vec::with_capacity(circuit.components.len());
+    // Per real node, per pin: its absolute point and declared width.
+    let mut input_points: Vec<Vec<(Point, u8)>> = Vec::with_capacity(circuit.components.len());
+    let mut output_points: Vec<Vec<(Point, u8)>> = Vec::with_capacity(circuit.components.len());
     // Only relevant for Subcircuit nodes: netlist.rs numbers a subcircuit
     // instance's pins as one flat space (inputs 0..n_in, outputs
     // n_in..n_in+n_out — see `netlist::TemplateNode::Subcircuit`'s doc),
     // unlike a leaf gate's independently-0-based input/output pins. Track
-    // the offset per node so output PinRefs can be shifted to match.
+    // the offset per node so output pin indices can be shifted to match.
     let mut output_pin_offset: Vec<usize> = Vec::with_capacity(circuit.components.len());
+    // `Splitter`s never become nodes (see this module's doc comment) — kept
+    // aside, consumed only by the union-find below.
+    let mut splitters: Vec<splitter::SplitterWiring> = Vec::new();
 
     for comp in &circuit.components {
-        if id_to_index.contains_key(comp.id.as_str()) {
+        if !seen_ids.insert(comp.id.as_str()) {
             return Err(CompileError::DuplicateComponentId {
                 circuit: circuit.name.clone(),
                 id: comp.id.clone(),
             });
         }
+
+        if comp.type_ == "core:Splitter" {
+            splitters.push(splitter::compile(circuit, comp)?);
+            continue;
+        }
+
         let idx = nodes.len();
         id_to_index.insert(comp.id.as_str(), idx);
 
@@ -274,44 +335,64 @@ fn compile_circuit(
                 })
                 .collect()
         };
-        input_points.push(abs(&geom.inputs));
-        output_points.push(abs(&geom.outputs));
+        let abs_in = abs(&geom.inputs);
+        let abs_out = abs(&geom.outputs);
+
+        // A `Subcircuit` node has no static width of its own (its pins are
+        // whatever the referenced circuit's own `InputPin`/`OutputPin`
+        // widths are) — everything else asks the just-built `node` directly.
+        let (in_widths, out_widths): (Vec<u8>, Vec<u8>) = match &node {
+            TemplateNode::Subcircuit(sub_name) => port_widths[sub_name].clone(),
+            _ => ((0..abs_in.len()).map(|p| node.input_width(p)).collect(), (0..abs_out.len()).map(|p| node.output_width(p)).collect()),
+        };
+
+        input_points.push(abs_in.into_iter().zip(in_widths).collect());
+        output_points.push(abs_out.into_iter().zip(out_widths).collect());
         nodes.push(node);
     }
 
-    // Union every pin position and wire endpoint that coincides, then
-    // snapshot each pin's net root once (avoids re-walking the DSU later).
+    // Union every pin's bit lanes and wire-endpoint lanes that coincide,
+    // then fuse `Splitter` lanes per their (arbitrary) bit_end/bit_thread
+    // mapping — see this module's doc comment.
     let mut dsu = Dsu::new();
     for pts in input_points.iter().chain(output_points.iter()) {
-        for &p in pts {
-            dsu.find(p);
+        for &(p, w) in pts {
+            for b in 0..w {
+                dsu.find((p, b));
+            }
         }
     }
     for wire in &circuit.wires {
-        dsu.union((wire.from[0], wire.from[1]), (wire.to[0], wire.to[1]));
+        let (from, to) = ((wire.from[0], wire.from[1]), (wire.to[0], wire.to[1]));
+        for b in 0..MAX_WIDTH {
+            dsu.union((from, b), (to, b));
+        }
+    }
+    for spl in &splitters {
+        for (i, &end) in spl.bit_end.iter().enumerate() {
+            if end > 0 {
+                let fanout_point = spl.fanout_points[(end - 1) as usize];
+                dsu.union((spl.combined_point, i as u8), (fanout_point, spl.bit_thread[i]));
+            }
+        }
     }
 
-    let mut nets: HashMap<Point, (Vec<PinRef>, Vec<PinRef>)> = HashMap::new();
-    let mut output_pin_root: Vec<Vec<Point>> = Vec::with_capacity(output_points.len());
+    let mut nets: HashMap<Lane, (Vec<BitRef>, Vec<BitRef>)> = HashMap::new();
     for (node_idx, pts) in output_points.iter().enumerate() {
-        let mut roots = Vec::with_capacity(pts.len());
-        for (pin_idx, &p) in pts.iter().enumerate() {
-            let root = dsu.find(p);
-            let pin_ref = (node_idx, pin_idx + output_pin_offset[node_idx]);
-            nets.entry(root).or_default().0.push(pin_ref);
-            roots.push(root);
+        for (pin_idx, &(p, w)) in pts.iter().enumerate() {
+            for b in 0..w {
+                let root = dsu.find((p, b));
+                nets.entry(root).or_default().0.push((node_idx, pin_idx + output_pin_offset[node_idx], b));
+            }
         }
-        output_pin_root.push(roots);
     }
-    let mut input_pin_root: Vec<Vec<Point>> = Vec::with_capacity(input_points.len());
     for (node_idx, pts) in input_points.iter().enumerate() {
-        let mut roots = Vec::with_capacity(pts.len());
-        for (pin_idx, &p) in pts.iter().enumerate() {
-            let root = dsu.find(p);
-            nets.entry(root).or_default().1.push((node_idx, pin_idx));
-            roots.push(root);
+        for (pin_idx, &(p, w)) in pts.iter().enumerate() {
+            for b in 0..w {
+                let root = dsu.find((p, b));
+                nets.entry(root).or_default().1.push((node_idx, pin_idx, b));
+            }
         }
-        input_pin_root.push(roots);
     }
 
     let mut connections = Vec::new();
@@ -327,16 +408,26 @@ fn compile_circuit(
         .into_iter()
         .map(|id| {
             let node_idx = id_to_index[id];
-            let root = output_pin_root[node_idx][0]; // InputPin has exactly one output pin
-            nets[&root].1.clone() // that net's input-direction pins = what this port feeds
+            let &(p, w) = &output_points[node_idx][0]; // InputPin has exactly one output pin
+            (0..w)
+                .map(|b| {
+                    let root = dsu.find((p, b));
+                    nets.get(&root).map(|(_, ins)| ins.clone()).unwrap_or_default() // that lane's input-direction bits = what this port bit feeds
+                })
+                .collect::<Vec<_>>()
         })
         .collect();
     let output_ports = port_component_ids(circuit, "core:OutputPin")
         .into_iter()
         .map(|id| {
             let node_idx = id_to_index[id];
-            let root = input_pin_root[node_idx][0]; // OutputPin has exactly one input pin
-            nets[&root].0.clone() // that net's output-direction pins = what drives this port
+            let &(p, w) = &input_points[node_idx][0]; // OutputPin has exactly one input pin
+            (0..w)
+                .map(|b| {
+                    let root = dsu.find((p, b));
+                    nets.get(&root).map(|(outs, _)| outs.clone()).unwrap_or_default() // that lane's output-direction bits = what drives this port bit
+                })
+                .collect::<Vec<_>>()
         })
         .collect();
 
@@ -352,6 +443,8 @@ fn compile_circuit(
         .map(|id| id_to_index[id])
         .collect();
 
+    let component_index = id_to_index.into_iter().map(|(id, idx)| (id.to_string(), idx)).collect();
+
     Ok(CircuitTemplate {
         name: circuit.name.clone(),
         nodes,
@@ -359,6 +452,7 @@ fn compile_circuit(
         input_ports,
         output_ports,
         port_marker_nodes,
+        component_index,
     })
 }
 

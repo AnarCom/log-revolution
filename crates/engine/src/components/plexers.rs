@@ -77,6 +77,44 @@ impl Gate {
         }
     }
 
+    /// Mux: data lines (0..n) are `bits` wide, select (index n) is
+    /// `select_bits` wide, the optional enable (index n+1) is 1 bit.
+    /// Demux: select (index 0) is `select_bits` wide, the optional enable
+    /// (index 1) is 1 bit, the one data line (last index) is `bits` wide.
+    pub(super) fn input_width_plexers(&self, pin: usize) -> u8 {
+        match self {
+            Gate::Mux { bits, select_bits, .. } => {
+                let n = 1usize << select_bits;
+                if pin < n {
+                    *bits
+                } else if pin == n {
+                    *select_bits
+                } else {
+                    1
+                }
+            }
+            Gate::Demux { bits, select_bits, has_enable, .. } => {
+                if pin == 0 {
+                    *select_bits
+                } else if *has_enable && pin == 1 {
+                    1
+                } else {
+                    *bits
+                }
+            }
+            _ => unreachable!("dispatch bug: not a plexer"),
+        }
+    }
+
+    /// Every output pin (Mux's one, or Demux's `2^select_bits`) is `bits`
+    /// wide.
+    pub(super) fn output_width_plexers(&self, _pin: usize) -> u8 {
+        match self {
+            Gate::Mux { bits, .. } | Gate::Demux { bits, .. } => *bits,
+            _ => unreachable!("dispatch bug: not a plexer"),
+        }
+    }
+
     pub(super) fn eval_plexers(&mut self, inputs: &[Signal]) -> Vec<Signal> {
         match self {
             Gate::Mux { bits, select_bits, has_enable, disabled_zero } => {

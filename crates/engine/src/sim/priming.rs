@@ -23,7 +23,7 @@ use crate::netlist::Netlist;
 pub(super) fn priming_depths(netlist: &Netlist) -> Vec<Time> {
     let n = netlist.gates.len();
     let direct_sources: Vec<Vec<usize>> =
-        netlist.input_sources.iter().map(|pins| pins.iter().flatten().map(|&(g, _)| g).collect()).collect();
+        netlist.input_sources.iter().map(|pins| pins.iter().flatten().flatten().map(|&(g, _, _)| g).collect()).collect();
 
     let mut depth: Vec<Option<Time>> = vec![None; n];
     loop {

@@ -25,10 +25,11 @@ fn and_circuit() -> CircuitTemplate {
             TemplateNode::And { bits: 1, inputs: 2 },       // 2
             TemplateNode::OutputPin { bits: 1 }, // 3: out
         ],
-        connections: vec![((0, 0), (2, 0)), ((1, 0), (2, 1)), ((2, 0), (3, 0))],
+        connections: vec![((0, 0, 0), (2, 0, 0)), ((1, 0, 0), (2, 1, 0)), ((2, 0, 0), (3, 0, 0))],
         input_ports: Vec::new(),
         output_ports: Vec::new(),
         port_marker_nodes: Vec::new(),
+        component_index: HashMap::new(),
     }
 }
 
@@ -57,9 +58,10 @@ fn and2_subcircuit() -> CircuitTemplate {
         name: "and2".to_string(),
         nodes: vec![TemplateNode::And { bits: 1, inputs: 2 }], // 0
         connections: Vec::new(),
-        input_ports: vec![vec![(0, 0)], vec![(0, 1)]],
-        output_ports: vec![vec![(0, 0)]],
+        input_ports: vec![vec![vec![(0, 0, 0)]], vec![vec![(0, 1, 0)]]],
+        output_ports: vec![vec![vec![(0, 0, 0)]]],
         port_marker_nodes: Vec::new(),
+        component_index: HashMap::new(),
     }
 }
 
@@ -79,16 +81,17 @@ fn two_instances_circuit() -> CircuitTemplate {
             TemplateNode::OutputPin { bits: 1 },            // 7: out2
         ],
         connections: vec![
-            ((0, 0), (4, 0)),
-            ((1, 0), (4, 1)),
-            ((4, 2), (6, 0)), // inst1's sole output port is pin index 2 (after the 2 input ports)
-            ((2, 0), (5, 0)),
-            ((3, 0), (5, 1)),
-            ((5, 2), (7, 0)),
+            ((0, 0, 0), (4, 0, 0)),
+            ((1, 0, 0), (4, 1, 0)),
+            ((4, 2, 0), (6, 0, 0)), // inst1's sole output port is pin index 2 (after the 2 input ports)
+            ((2, 0, 0), (5, 0, 0)),
+            ((3, 0, 0), (5, 1, 0)),
+            ((5, 2, 0), (7, 0, 0)),
         ],
         input_ports: Vec::new(),
         output_ports: Vec::new(),
         port_marker_nodes: Vec::new(),
+        component_index: HashMap::new(),
     }
 }
 
@@ -124,10 +127,11 @@ fn shared_point_circuit() -> CircuitTemplate {
             TemplateNode::InputPin { bits: 1 },  // 1: b
             TemplateNode::OutputPin { bits: 1 }, // 2: out — fed by both a and b
         ],
-        connections: vec![((0, 0), (2, 0)), ((1, 0), (2, 0))],
+        connections: vec![((0, 0, 0), (2, 0, 0)), ((1, 0, 0), (2, 0, 0))],
         input_ports: Vec::new(),
         output_ports: Vec::new(),
         port_marker_nodes: Vec::new(),
+        component_index: HashMap::new(),
     }
 }
 
@@ -167,16 +171,17 @@ fn two_disjoint_chains() -> CircuitTemplate {
             TemplateNode::OutputPin { bits: 1 }, // 7: out2
         ],
         connections: vec![
-            ((0, 0), (2, 0)),
-            ((1, 0), (2, 1)),
-            ((2, 0), (3, 0)),
-            ((4, 0), (6, 0)),
-            ((5, 0), (6, 1)),
-            ((6, 0), (7, 0)),
+            ((0, 0, 0), (2, 0, 0)),
+            ((1, 0, 0), (2, 1, 0)),
+            ((2, 0, 0), (3, 0, 0)),
+            ((4, 0, 0), (6, 0, 0)),
+            ((5, 0, 0), (6, 1, 0)),
+            ((6, 0, 0), (7, 0, 0)),
         ],
         input_ports: Vec::new(),
         output_ports: Vec::new(),
         port_marker_nodes: Vec::new(),
+        component_index: HashMap::new(),
     }
 }
 
@@ -208,10 +213,11 @@ fn pulled_output_circuit() -> CircuitTemplate {
             TemplateNode::PullResistor(Bit::One), // 1: pull-up
             TemplateNode::OutputPin { bits: 1 },            // 2: out — fed by both
         ],
-        connections: vec![((0, 0), (2, 0)), ((1, 0), (2, 0))],
+        connections: vec![((0, 0, 0), (2, 0, 0)), ((1, 0, 0), (2, 0, 0))],
         input_ports: Vec::new(),
         output_ports: Vec::new(),
         port_marker_nodes: Vec::new(),
+        component_index: HashMap::new(),
     }
 }
 
@@ -243,10 +249,11 @@ fn pull_resistor_fills_in_when_truly_unconnected() {
         CircuitTemplate {
             name: "main".to_string(),
             nodes: vec![TemplateNode::PullResistor(Bit::One), TemplateNode::OutputPin { bits: 1 }],
-            connections: vec![((0, 0), (1, 0))],
+            connections: vec![((0, 0, 0), (1, 0, 0))],
             input_ports: Vec::new(),
             output_ports: Vec::new(),
             port_marker_nodes: Vec::new(),
+        component_index: HashMap::new(),
         },
     );
     let netlist = flatten("main", &library).unwrap();
@@ -268,10 +275,11 @@ fn pull_resistor_does_not_mask_a_real_short_circuit() {
                 TemplateNode::PullResistor(Bit::One), // 2
                 TemplateNode::OutputPin { bits: 1 },              // 3: out
             ],
-            connections: vec![((0, 0), (3, 0)), ((1, 0), (3, 0)), ((2, 0), (3, 0))],
+            connections: vec![((0, 0, 0), (3, 0, 0)), ((1, 0, 0), (3, 0, 0)), ((2, 0, 0), (3, 0, 0))],
             input_ports: Vec::new(),
             output_ports: Vec::new(),
             port_marker_nodes: Vec::new(),
+        component_index: HashMap::new(),
         },
     );
     let netlist = flatten("main", &library).unwrap();
@@ -311,10 +319,11 @@ fn clock_feeds_register_circuit() -> CircuitTemplate {
             TemplateNode::Register { bits: 1, trigger: crate::components::Trigger::Rising }, // 2
             TemplateNode::OutputPin { bits: 1 },          // 3: Q
         ],
-        connections: vec![((0, 0), (2, 0)), ((1, 0), (2, 1)), ((2, 0), (3, 0))],
+        connections: vec![((0, 0, 0), (2, 0, 0)), ((1, 0, 0), (2, 1, 0)), ((2, 0, 0), (3, 0, 0))],
         input_ports: Vec::new(),
         output_ports: Vec::new(),
         port_marker_nodes: Vec::new(),
+        component_index: HashMap::new(),
     }
 }
 

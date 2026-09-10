@@ -25,6 +25,23 @@ impl Gate {
         }
     }
 
+    pub(super) fn input_width_wiring(&self, _pin: usize) -> u8 {
+        match self {
+            Gate::OutputPin { bits, .. } => *bits,
+            _ => unreachable!("dispatch bug: not a wiring gate with an input"),
+        }
+    }
+
+    /// `PullResistor` stays fixed at 1 bit — see `Gate::PullResistor`'s doc
+    /// comment (per-net width inference for it is deferred, PLAN.md §14).
+    pub(super) fn output_width_wiring(&self, _pin: usize) -> u8 {
+        match self {
+            Gate::Constant { bits, .. } | Gate::InputPin { bits, .. } => *bits,
+            Gate::PullResistor { .. } => 1,
+            _ => unreachable!("dispatch bug: not a wiring gate with an output"),
+        }
+    }
+
     pub(super) fn eval_wiring(&mut self, inputs: &[Signal]) -> Vec<Signal> {
         match self {
             Gate::Constant { bits, value } => vec![u32_to_signal(*value, *bits)],

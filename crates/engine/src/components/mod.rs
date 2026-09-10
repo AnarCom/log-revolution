@@ -205,6 +205,38 @@ impl Gate {
     pub fn tick(&mut self, global_tick: u64) -> bool {
         self.tick_memory(global_tick)
     }
+
+    /// Declared width of input pin `pin` — not part of `Component` (the
+    /// generic plugin ABI has no notion of per-pin width), only needed by
+    /// `netlist.rs`'s `Builder`, which already works with the concrete
+    /// `Gate` type directly. Needed because `Splitter` (`compile/
+    /// splitter.rs`) wires individual *bits* of a pin, not just whole pins
+    /// — `sim.rs::gather_inputs` must know a pin's true width even for
+    /// bits nothing drives, so a floating bit reads as an explicit
+    /// `Unknown` entry rather than silently shortening the assembled
+    /// signal (which would, e.g., make `Register`'s `D.isFullyDefined()`
+    /// check see a shorter-than-real word and wrongly call it fully
+    /// defined).
+    pub fn input_width(&self, pin: usize) -> u8 {
+        match self {
+            Gate::Clock { .. } | Gate::Register { .. } => self.input_width_memory(pin),
+            Gate::Constant { .. } | Gate::InputPin { .. } | Gate::OutputPin { .. } | Gate::PullResistor { .. } => self.input_width_wiring(pin),
+            Gate::Mux { .. } | Gate::Demux { .. } => self.input_width_plexers(pin),
+            _ => self.input_width_logic(pin),
+        }
+    }
+
+    /// Declared width of output pin `pin` — see `input_width`'s doc for why
+    /// this exists; used the same way, to size `Builder::add_gate`'s
+    /// `fanout` entries.
+    pub fn output_width(&self, pin: usize) -> u8 {
+        match self {
+            Gate::Clock { .. } | Gate::Register { .. } => self.output_width_memory(pin),
+            Gate::Constant { .. } | Gate::InputPin { .. } | Gate::OutputPin { .. } | Gate::PullResistor { .. } => self.output_width_wiring(pin),
+            Gate::Mux { .. } | Gate::Demux { .. } => self.output_width_plexers(pin),
+            _ => self.output_width_logic(pin),
+        }
+    }
 }
 
 impl Component for Gate {

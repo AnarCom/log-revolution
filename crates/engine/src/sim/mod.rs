@@ -142,41 +142,49 @@ impl Simulation {
         self.time
     }
 
-    /// One pin's value: `combine` every *real* driver connected to it
-    /// (PLAN.md §9 — reproducing tri-state/short-circuit behavior, not just
-    /// "take the one source"); zero real drivers folds to `Unknown`, two
-    /// disagreeing ones fold to `Error`. `PullResistor` drivers are kept
-    /// out of that fold and applied afterward, only if the real-driver
-    /// result is `Unknown` — a lone well-defined driver or an actual
-    /// conflict both override the pull untouched. Mirrors
-    /// `CircuitWires.getThreadValue`/`pullValue` in `logisim-port`
-    /// exactly, not a simplification of it.
+    /// One pin's value, one bit lane at a time: `combine` every *real*
+    /// driver connected to that exact lane (PLAN.md §9 — reproducing
+    /// tri-state/short-circuit behavior, not just "take the one source");
+    /// zero real drivers folds to `Unknown`, two disagreeing ones fold to
+    /// `Error`. `PullResistor` drivers are kept out of that fold and
+    /// applied afterward, only if the real-driver result is `Unknown` — a
+    /// lone well-defined driver or an actual conflict both override the
+    /// pull untouched. Mirrors `CircuitWires.getThreadValue`/`pullValue` in
+    /// `logisim-port` exactly, not a simplification of it.
     ///
-    /// Per-bit, not per-pin: a pin can be a multi-bit bus (up to 32 —
-    /// `Value.MAX_WIDTH`), and `combine` is applied independently at each
-    /// bit position (a driver narrower than the widest one on the same
-    /// point reads as `Unknown` on the missing high bits, same as
-    /// `Component::eval`'s own `bit_at`/`Signal::get` convention).
+    /// `netlist.input_sources[gate][pin]` is pre-sized to that pin's true
+    /// declared width (`Netlist::input_sources`'s doc) — so a lane with
+    /// zero registered drivers still gets its own `Unknown` entry in the
+    /// assembled `Signal`, at the right position, rather than shortening
+    /// it. Each lane's drivers are explicit `BitRef`s now (not an implicit
+    /// "bit `i` of every whole-pin source"), because a `Splitter` can wire
+    /// two lanes of the very same destination pin to entirely different,
+    /// differently-widthed source pins.
     fn gather_inputs(&self, gate: usize) -> Vec<Signal> {
         self.netlist.input_sources[gate]
             .iter()
-            .map(|sources| {
-                let width = sources.iter().map(|&(g, p)| self.outputs[g][p].len()).max().unwrap_or(1);
-                let mut real = vec![Bit::Unknown; width];
-                let mut pull = vec![Bit::Unknown; width];
-                for &(g, p) in sources {
-                    let signal = &self.outputs[g][p];
-                    let target = if matches!(self.netlist.gates[g], crate::components::Gate::PullResistor { .. }) {
-                        &mut pull
-                    } else {
-                        &mut real
-                    };
-                    for i in 0..width {
-                        let v = signal.get(i).copied().unwrap_or(Bit::Unknown);
-                        target[i] = target[i].combine(v);
-                    }
-                }
-                (0..width).map(|i| if real[i] == Bit::Unknown { pull[i] } else { real[i] }).collect()
+            .map(|per_bit| {
+                per_bit
+                    .iter()
+                    .map(|sources| {
+                        let mut real = Bit::Unknown;
+                        let mut pull = Bit::Unknown;
+                        for &(g, p, b) in sources {
+                            let v = self.outputs[g][p].get(b as usize).copied().unwrap_or(Bit::Unknown);
+                            let target = if matches!(self.netlist.gates[g], crate::components::Gate::PullResistor { .. }) {
+                                &mut pull
+                            } else {
+                                &mut real
+                            };
+                            *target = target.combine(v);
+                        }
+                        if real == Bit::Unknown {
+                            pull
+                        } else {
+                            real
+                        }
+                    })
+                    .collect()
             })
             .collect()
     }
@@ -240,7 +248,8 @@ impl Simulation {
                 let targets: Vec<usize> = self.netlist.fanout[idx]
                     .iter()
                     .flatten()
-                    .map(|&(dst_gate, _dst_pin)| dst_gate)
+                    .flatten()
+                    .map(|&(dst_gate, _dst_pin, _dst_bit)| dst_gate)
                     .collect();
                 for dst_gate in targets {
                     self.schedule(dst_gate);

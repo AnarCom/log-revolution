@@ -12,7 +12,7 @@
 
 use engine::compile::{compile, CompileError};
 use engine::ctest;
-use engine::file_format::{ComponentInstance, ProjectFile};
+use engine::file_format::ProjectFile;
 use engine::netlist::{flatten_with_entry_map, NetlistError};
 use engine::sim::Simulation;
 use plugin_abi::{Bit, Value};
@@ -66,25 +66,32 @@ struct Loaded {
     project: ProjectFile,
     sim: Simulation,
     entry_map: HashMap<usize, usize>,
+    /// The main circuit's own `id -> local node index` map (`CircuitTemplate::
+    /// component_index`) — *not* the same as position in `Circuit::
+    /// components`, since a `Splitter` consumes a slot in that raw JSON
+    /// array but never becomes a node (see `component_index`'s doc).
+    component_index: HashMap<String, usize>,
 }
 
 fn load(project_path: &str) -> Result<Loaded, LoadError> {
     let text = fs::read_to_string(project_path).map_err(|e| LoadError::Io(project_path.to_string(), e))?;
     let project: ProjectFile = serde_json::from_str(&text).map_err(|e| LoadError::Json(project_path.to_string(), e))?;
     let library = compile(&project).map_err(LoadError::Compile)?;
+    let component_index = library.get(&project.main_circuit).map(|t| t.component_index.clone()).unwrap_or_default();
     let (netlist, entry_map) = flatten_with_entry_map(&project.main_circuit, &library).map_err(LoadError::Flatten)?;
     if !project.circuits.iter().any(|c| c.name == project.main_circuit) {
         return Err(LoadError::MissingMainCircuit(project.main_circuit.clone(), project.circuits.len()));
     }
-    Ok(Loaded { project, sim: Simulation::new(netlist), entry_map })
+    Ok(Loaded { project, sim: Simulation::new(netlist), entry_map, component_index })
 }
 
-/// Resolves `component[id]` against the main circuit's own component list
-/// — the same one the compiler numbered nodes from, so position in that
-/// list is exactly the local index `entry_map` keys on.
-fn resolver<'a>(main_components: &'a [ComponentInstance], entry_map: &'a HashMap<usize, usize>) -> impl Fn(&str) -> Option<usize> + 'a {
+/// Resolves `component[id]` via the main circuit's `component_index` (its
+/// JSON `id` -> local node index, as the compiler actually numbered it —
+/// see `Loaded::component_index`'s doc), then through `entry_map` to a
+/// global gate index.
+fn resolver<'a>(component_index: &'a HashMap<String, usize>, entry_map: &'a HashMap<usize, usize>) -> impl Fn(&str) -> Option<usize> + 'a {
     move |id: &str| {
-        let local = main_components.iter().position(|c| c.id == id)?;
+        let &local = component_index.get(id)?;
         entry_map.get(&local).copied()
     }
 }
@@ -102,10 +109,13 @@ fn run_report(project_path: &str) -> ExitCode {
     let main_circuit = loaded.project.circuits.iter().find(|c| c.name == loaded.project.main_circuit).expect("checked in load()");
 
     println!("circuit: {}", main_circuit.name);
-    for (local_idx, comp) in main_circuit.components.iter().enumerate() {
+    for comp in main_circuit.components.iter() {
         if comp.type_ != "core:InputPin" && comp.type_ != "core:OutputPin" {
             continue;
         }
+        let Some(&local_idx) = loaded.component_index.get(&comp.id) else {
+            continue;
+        };
         let Some(&gate) = loaded.entry_map.get(&local_idx) else {
             continue;
         };
@@ -146,8 +156,7 @@ fn run_test(project_path: &str, script_path: &str) -> ExitCode {
         }
     };
 
-    let main_circuit = loaded.project.circuits.iter().find(|c| c.name == loaded.project.main_circuit).expect("checked in load()");
-    let resolve = resolver(&main_circuit.components, &loaded.entry_map);
+    let resolve = resolver(&loaded.component_index, &loaded.entry_map);
     let report = ctest::run(&script, &mut loaded.sim, resolve);
 
     println!("{script_path}: {} assert(s), {} failure(s)", report.asserts_run, report.failures.len());

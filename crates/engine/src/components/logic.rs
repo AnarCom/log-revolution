@@ -43,6 +43,26 @@ impl Gate {
             _ => unreachable!("dispatch bug: not a logic gate"),
         }
     }
+
+    /// Every pin (however many inputs, per `input_count_logic`) is `bits`
+    /// wide — none of these gates has a control pin narrower than its data.
+    pub(super) fn input_width_logic(&self, _pin: usize) -> u8 {
+        match self {
+            Gate::And { bits, .. }
+            | Gate::Or { bits, .. }
+            | Gate::Not { bits }
+            | Gate::Nand { bits, .. }
+            | Gate::Nor { bits, .. }
+            | Gate::Xor { bits, .. }
+            | Gate::Xnor { bits, .. }
+            | Gate::Buffer { bits } => *bits,
+            _ => unreachable!("dispatch bug: not a logic gate"),
+        }
+    }
+
+    pub(super) fn output_width_logic(&self, _pin: usize) -> u8 {
+        self.input_width_logic(0)
+    }
 }
 
 /// `GateFunctions.computeAnd`/`computeOr`'s N-input fold, generalized across
