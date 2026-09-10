@@ -33,6 +33,19 @@
 //! `splitter` doesn't participate in that dispatch — it doesn't produce a
 //! `(TemplateNode, Geometry)` pair, so `compile_circuit` calls it directly.
 //!
+//! `Tunnel` is the same story, minus even a dedicated submodule: like
+//! `Splitter`, `Tunnel.propagate` is a no-op in `logisim-port` ("nothing to
+//! do — handled by circuit") — the real fusion is `CircuitWires.
+//! connectTunnels`, which groups same-circuit `Tunnel` instances by their
+//! (trimmed, non-empty) `label` attribute and unions each group's location
+//! into one `WireBundle`, exactly as if a wire ran between them. No bit
+//! remapping, no width attribute involved (a `Tunnel`'s own `StdAttr.WIDTH`
+//! only sizes its on-screen pin — verified in `Tunnel.java`/
+//! `TunnelAttributes.java`), so `compile_circuit` just unions all 32 lanes
+//! between every pair of same-label locations, the same way it unions wire
+//! endpoints. A `Tunnel` with an empty or unique label creates no unions
+//! and is otherwise inert, matching Java's `if (!label.equals(""))` guard.
+//!
 //! Component attribute keys (`"width"`, `"inputs"`, `"value"`, `"pull"`,
 //! `"highDuration"`/`"lowDuration"`, `"trigger"`, `"incoming"`/`"fanout"`)
 //! deliberately reuse real Logisim's own attribute names (`StdAttr.WIDTH` =
@@ -215,6 +228,14 @@ fn width_attr(circuit: &Circuit, comp: &ComponentInstance) -> Result<u8, Compile
     }
 }
 
+/// `attrs["label"]`, trimmed — `Tunnel`'s connectivity key (`StdAttr.LABEL`,
+/// grouped by `CircuitWires.connectTunnels` exactly as read here: trimmed,
+/// empty means "not part of any group"). Defaults to `""` same as
+/// `TunnelAttributes`'s own constructor.
+fn tunnel_label(comp: &ComponentInstance) -> String {
+    comp.attrs.get("label").and_then(|v| v.as_str()).unwrap_or("").trim().to_string()
+}
+
 /// Compiles every circuit in `project` into a `CircuitTemplate` library,
 /// keyed by circuit name — ready for `netlist::flatten(&project.main_circuit, ..)`.
 pub fn compile(project: &ProjectFile) -> Result<HashMap<String, CircuitTemplate>, CompileError> {
@@ -291,6 +312,9 @@ fn compile_circuit(
     // `Splitter`s never become nodes (see this module's doc comment) — kept
     // aside, consumed only by the union-find below.
     let mut splitters: Vec<splitter::SplitterWiring> = Vec::new();
+    // `Tunnel`s never become nodes either (same doc comment) — grouped by
+    // label, consumed only by the union-find below.
+    let mut tunnels: HashMap<String, Vec<Point>> = HashMap::new();
 
     for comp in &circuit.components {
         if !seen_ids.insert(comp.id.as_str()) {
@@ -302,6 +326,14 @@ fn compile_circuit(
 
         if comp.type_ == "core:Splitter" {
             splitters.push(splitter::compile(circuit, comp)?);
+            continue;
+        }
+
+        if comp.type_ == "core:Tunnel" {
+            let label = tunnel_label(comp);
+            if !label.is_empty() {
+                tunnels.entry(label).or_default().push((comp.x, comp.y));
+            }
             continue;
         }
 
@@ -378,6 +410,13 @@ fn compile_circuit(
             if end > 0 {
                 let fanout_point = spl.fanout_points[(end - 1) as usize];
                 dsu.union((spl.combined_point, i as u8), (fanout_point, spl.bit_thread[i]));
+            }
+        }
+    }
+    for points in tunnels.values() {
+        for pair in points.windows(2) {
+            for b in 0..MAX_WIDTH {
+                dsu.union((pair[0], b), (pair[1], b));
             }
         }
     }
@@ -513,7 +552,7 @@ mod tests {
     use crate::file_format::{Circuit, ComponentInstance};
     use crate::netlist::flatten;
     use crate::sim::Simulation;
-    use plugin_abi::Bit;
+    use plugin_abi::{Bit, Value};
     use serde_json::json;
     use std::collections::BTreeMap;
 
@@ -638,5 +677,127 @@ mod tests {
             annotations: vec![],
         });
         compile(&project).unwrap();
+    }
+
+    /// Two same-labeled `Tunnel`s fuse their locations exactly like a wire
+    /// would — `t1`/`t2` never share a wire segment, only a label
+    /// (`CircuitWires.connectTunnels`, verified against `Tunnel.java`/
+    /// `TunnelAttributes.java`). All 4 bits must cross, not just bit 0, to
+    /// prove the fusion unions every lane rather than a single one.
+    #[test]
+    fn tunnel_connects_same_labeled_points_without_a_direct_wire() {
+        let mut w4 = BTreeMap::new();
+        w4.insert("width".to_string(), json!(4));
+        let mut label_sig = BTreeMap::new();
+        label_sig.insert("label".to_string(), json!("sig"));
+
+        let project = single_circuit_project(Circuit {
+            name: "main".to_string(),
+            components: vec![
+                ComponentInstance { attrs: w4.clone(), ..comp("in", "core:InputPin", 0, 0) },
+                ComponentInstance { attrs: label_sig.clone(), ..comp("t1", "core:Tunnel", 5, 5) },
+                ComponentInstance { attrs: label_sig.clone(), ..comp("t2", "core:Tunnel", 50, 50) },
+                ComponentInstance { attrs: w4, ..comp("out", "core:OutputPin", 60, 60) },
+            ],
+            wires: vec![wire("w1", [0, 0], [5, 5]), wire("w2", [50, 50], [60, 60])],
+            annotations: vec![],
+        });
+
+        let library = compile(&project).unwrap();
+        let netlist = flatten(&project.main_circuit, &library).unwrap();
+        let mut sim = Simulation::new(netlist);
+        sim.invoke(0, "set", Some(Value::Int(0b1011))).unwrap();
+        sim.run_to_quiescence();
+        // Node indices: `Tunnel`s never become nodes, so `in`=0, `out`=1.
+        assert_eq!(get_bits(&sim, 1), vec![Bit::One, Bit::One, Bit::Zero, Bit::One]);
+    }
+
+    /// `Tunnel`'s port is `Port.INOUT` in Java (`Tunnel.java`'s
+    /// `configureNewInstance`), not a fixed source/sink — the previous test
+    /// happens to drive through `t1` and read through `t2`; this one drives
+    /// through `t2` and reads through `t1` (`in`/`out` sit exactly on the
+    /// tunnels' own coordinates, no wire needed) to prove the fusion has no
+    /// baked-in direction, matching a plain wire's own symmetry.
+    #[test]
+    fn tunnel_is_direction_agnostic() {
+        let mut w4 = BTreeMap::new();
+        w4.insert("width".to_string(), json!(4));
+        let mut label_sig = BTreeMap::new();
+        label_sig.insert("label".to_string(), json!("sig"));
+
+        let project = single_circuit_project(Circuit {
+            name: "main".to_string(),
+            components: vec![
+                ComponentInstance { attrs: w4.clone(), ..comp("in", "core:InputPin", 50, 50) }, // sits on t2
+                ComponentInstance { attrs: label_sig.clone(), ..comp("t1", "core:Tunnel", 5, 5) },
+                ComponentInstance { attrs: label_sig.clone(), ..comp("t2", "core:Tunnel", 50, 50) },
+                ComponentInstance { attrs: w4, ..comp("out", "core:OutputPin", 5, 5) }, // sits on t1
+            ],
+            wires: vec![],
+            annotations: vec![],
+        });
+
+        let library = compile(&project).unwrap();
+        let netlist = flatten(&project.main_circuit, &library).unwrap();
+        let mut sim = Simulation::new(netlist);
+        sim.invoke(0, "set", Some(Value::Int(0b1011))).unwrap();
+        sim.run_to_quiescence();
+        assert_eq!(get_bits(&sim, 1), vec![Bit::One, Bit::One, Bit::Zero, Bit::One]);
+    }
+
+    /// Distinct labels never connect, same as distinct `WireBundle`s in
+    /// Java — the far `OutputPin` reads floating, not a stray `Zero`.
+    #[test]
+    fn tunnels_with_different_labels_stay_unconnected() {
+        let mut label_a = BTreeMap::new();
+        label_a.insert("label".to_string(), json!("a"));
+        let mut label_b = BTreeMap::new();
+        label_b.insert("label".to_string(), json!("b"));
+
+        let project = single_circuit_project(Circuit {
+            name: "main".to_string(),
+            components: vec![
+                comp("in", "core:InputPin", 0, 0),
+                ComponentInstance { attrs: label_a, ..comp("t1", "core:Tunnel", 5, 5) },
+                ComponentInstance { attrs: label_b, ..comp("t2", "core:Tunnel", 50, 50) },
+                comp("out", "core:OutputPin", 60, 60),
+            ],
+            wires: vec![wire("w1", [0, 0], [5, 5]), wire("w2", [50, 50], [60, 60])],
+            annotations: vec![],
+        });
+
+        let library = compile(&project).unwrap();
+        let netlist = flatten(&project.main_circuit, &library).unwrap();
+        let mut sim = Simulation::new(netlist);
+        sim.invoke(0, "on", None).unwrap();
+        sim.run_to_quiescence();
+        // Node indices: `Tunnel`s never become nodes, so `in`=0, `out`=1.
+        assert_eq!(get_bit(&sim, 1), Bit::Unknown);
+    }
+
+    /// An empty label (`Tunnel`'s own default, `TunnelAttributes`'s
+    /// constructor) is inert in Java (`if (!label.equals(""))`) — two
+    /// unlabeled `Tunnel`s must not accidentally connect to each other.
+    #[test]
+    fn tunnels_with_empty_label_stay_unconnected() {
+        let project = single_circuit_project(Circuit {
+            name: "main".to_string(),
+            components: vec![
+                comp("in", "core:InputPin", 0, 0),
+                comp("t1", "core:Tunnel", 5, 5),
+                comp("t2", "core:Tunnel", 50, 50),
+                comp("out", "core:OutputPin", 60, 60),
+            ],
+            wires: vec![wire("w1", [0, 0], [5, 5]), wire("w2", [50, 50], [60, 60])],
+            annotations: vec![],
+        });
+
+        let library = compile(&project).unwrap();
+        let netlist = flatten(&project.main_circuit, &library).unwrap();
+        let mut sim = Simulation::new(netlist);
+        sim.invoke(0, "on", None).unwrap();
+        sim.run_to_quiescence();
+        // Node indices: `Tunnel`s never become nodes, so `in`=0, `out`=1.
+        assert_eq!(get_bit(&sim, 1), Bit::Unknown);
     }
 }
