@@ -28,11 +28,17 @@ pub type PinRef = (usize, usize); // (node index, pin index)
 
 #[derive(Debug, Clone)]
 pub enum TemplateNode {
-    And,
-    Or,
-    Not,
-    InputPin,
-    OutputPin,
+    And { bits: u8, inputs: usize },
+    Or { bits: u8, inputs: usize },
+    Not { bits: u8 },
+    Nand { bits: u8, inputs: usize },
+    Nor { bits: u8, inputs: usize },
+    Xor { bits: u8, inputs: usize },
+    Xnor { bits: u8, inputs: usize },
+    Buffer { bits: u8 },
+    Constant { bits: u8, value: u32 },
+    InputPin { bits: u8 },
+    OutputPin { bits: u8 },
     /// A weak source pulling its point to `Bit` when nothing else drives
     /// it — see `Gate::PullResistor` for why it's wired in like a normal
     /// driver but resolved specially.
@@ -179,20 +185,38 @@ fn expand(
 
     for (local_idx, node) in template.nodes.iter().enumerate() {
         match node {
-            TemplateNode::And => {
-                local_to_global.insert(local_idx, builder.add_gate(Gate::And));
+            TemplateNode::And { bits, inputs } => {
+                local_to_global.insert(local_idx, builder.add_gate(Gate::And { bits: *bits, inputs: *inputs }));
             }
-            TemplateNode::Or => {
-                local_to_global.insert(local_idx, builder.add_gate(Gate::Or));
+            TemplateNode::Or { bits, inputs } => {
+                local_to_global.insert(local_idx, builder.add_gate(Gate::Or { bits: *bits, inputs: *inputs }));
             }
-            TemplateNode::Not => {
-                local_to_global.insert(local_idx, builder.add_gate(Gate::Not));
+            TemplateNode::Not { bits } => {
+                local_to_global.insert(local_idx, builder.add_gate(Gate::Not { bits: *bits }));
             }
-            TemplateNode::InputPin => {
-                local_to_global.insert(local_idx, builder.add_gate(Gate::InputPin { value: Bit::Zero }));
+            TemplateNode::Nand { bits, inputs } => {
+                local_to_global.insert(local_idx, builder.add_gate(Gate::Nand { bits: *bits, inputs: *inputs }));
             }
-            TemplateNode::OutputPin => {
-                local_to_global.insert(local_idx, builder.add_gate(Gate::OutputPin { value: Bit::Zero }));
+            TemplateNode::Nor { bits, inputs } => {
+                local_to_global.insert(local_idx, builder.add_gate(Gate::Nor { bits: *bits, inputs: *inputs }));
+            }
+            TemplateNode::Xor { bits, inputs } => {
+                local_to_global.insert(local_idx, builder.add_gate(Gate::Xor { bits: *bits, inputs: *inputs }));
+            }
+            TemplateNode::Xnor { bits, inputs } => {
+                local_to_global.insert(local_idx, builder.add_gate(Gate::Xnor { bits: *bits, inputs: *inputs }));
+            }
+            TemplateNode::Buffer { bits } => {
+                local_to_global.insert(local_idx, builder.add_gate(Gate::Buffer { bits: *bits }));
+            }
+            TemplateNode::Constant { bits, value } => {
+                local_to_global.insert(local_idx, builder.add_gate(Gate::Constant { bits: *bits, value: *value }));
+            }
+            TemplateNode::InputPin { bits } => {
+                local_to_global.insert(local_idx, builder.add_gate(Gate::InputPin { bits: *bits, value: vec![Bit::Zero; *bits as usize] }));
+            }
+            TemplateNode::OutputPin { bits } => {
+                local_to_global.insert(local_idx, builder.add_gate(Gate::OutputPin { bits: *bits, value: vec![Bit::Zero; *bits as usize] }));
             }
             TemplateNode::PullResistor(to) => {
                 local_to_global.insert(local_idx, builder.add_gate(Gate::PullResistor { to: *to }));

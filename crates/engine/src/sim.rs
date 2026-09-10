@@ -81,22 +81,32 @@ impl Simulation {
     /// conflict both override the pull untouched. Mirrors
     /// `CircuitWires.getThreadValue`/`pullValue` in `logisim-port`
     /// exactly, not a simplification of it.
+    ///
+    /// Per-bit, not per-pin: a pin can be a multi-bit bus (up to 32 —
+    /// `Value.MAX_WIDTH`), and `combine` is applied independently at each
+    /// bit position (a driver narrower than the widest one on the same
+    /// point reads as `Unknown` on the missing high bits, same as
+    /// `Component::eval`'s own `bit_at`/`Signal::get` convention).
     fn gather_inputs(&self, gate: usize) -> Vec<Signal> {
         self.netlist.input_sources[gate]
             .iter()
             .map(|sources| {
-                let mut real = Bit::Unknown;
-                let mut pull = Bit::Unknown;
+                let width = sources.iter().map(|&(g, p)| self.outputs[g][p].len()).max().unwrap_or(1);
+                let mut real = vec![Bit::Unknown; width];
+                let mut pull = vec![Bit::Unknown; width];
                 for &(g, p) in sources {
-                    let v = self.outputs[g][p].first().copied().unwrap_or(Bit::Unknown);
-                    if matches!(self.netlist.gates[g], crate::components::Gate::PullResistor { .. }) {
-                        pull = pull.combine(v);
+                    let signal = &self.outputs[g][p];
+                    let target = if matches!(self.netlist.gates[g], crate::components::Gate::PullResistor { .. }) {
+                        &mut pull
                     } else {
-                        real = real.combine(v);
+                        &mut real
+                    };
+                    for i in 0..width {
+                        let v = signal.get(i).copied().unwrap_or(Bit::Unknown);
+                        target[i] = target[i].combine(v);
                     }
                 }
-                let resolved = if real == Bit::Unknown { pull } else { real };
-                vec![resolved]
+                (0..width).map(|i| if real[i] == Bit::Unknown { pull[i] } else { real[i] }).collect()
             })
             .collect()
     }
@@ -220,10 +230,10 @@ mod tests {
         CircuitTemplate {
             name: "and_circuit".to_string(),
             nodes: vec![
-                TemplateNode::InputPin,  // 0: a
-                TemplateNode::InputPin,  // 1: b
-                TemplateNode::And,       // 2
-                TemplateNode::OutputPin, // 3: out
+                TemplateNode::InputPin { bits: 1 },  // 0: a
+                TemplateNode::InputPin { bits: 1 },  // 1: b
+                TemplateNode::And { bits: 1, inputs: 2 },       // 2
+                TemplateNode::OutputPin { bits: 1 }, // 3: out
             ],
             connections: vec![((0, 0), (2, 0)), ((1, 0), (2, 1)), ((2, 0), (3, 0))],
             input_ports: Vec::new(),
@@ -255,7 +265,7 @@ mod tests {
     fn and2_subcircuit() -> CircuitTemplate {
         CircuitTemplate {
             name: "and2".to_string(),
-            nodes: vec![TemplateNode::And], // 0
+            nodes: vec![TemplateNode::And { bits: 1, inputs: 2 }], // 0
             connections: Vec::new(),
             input_ports: vec![vec![(0, 0)], vec![(0, 1)]],
             output_ports: vec![vec![(0, 0)]],
@@ -269,14 +279,14 @@ mod tests {
         CircuitTemplate {
             name: "main".to_string(),
             nodes: vec![
-                TemplateNode::InputPin,             // 0: a1
-                TemplateNode::InputPin,             // 1: b1
-                TemplateNode::InputPin,             // 2: a2
-                TemplateNode::InputPin,             // 3: b2
+                TemplateNode::InputPin { bits: 1 },             // 0: a1
+                TemplateNode::InputPin { bits: 1 },             // 1: b1
+                TemplateNode::InputPin { bits: 1 },             // 2: a2
+                TemplateNode::InputPin { bits: 1 },             // 3: b2
                 TemplateNode::Subcircuit("and2".to_string()), // 4: inst1
                 TemplateNode::Subcircuit("and2".to_string()), // 5: inst2
-                TemplateNode::OutputPin,            // 6: out1
-                TemplateNode::OutputPin,            // 7: out2
+                TemplateNode::OutputPin { bits: 1 },            // 6: out1
+                TemplateNode::OutputPin { bits: 1 },            // 7: out2
             ],
             connections: vec![
                 ((0, 0), (4, 0)),
@@ -320,9 +330,9 @@ mod tests {
         CircuitTemplate {
             name: "main".to_string(),
             nodes: vec![
-                TemplateNode::InputPin,  // 0: a
-                TemplateNode::InputPin,  // 1: b
-                TemplateNode::OutputPin, // 2: out — fed by both a and b
+                TemplateNode::InputPin { bits: 1 },  // 0: a
+                TemplateNode::InputPin { bits: 1 },  // 1: b
+                TemplateNode::OutputPin { bits: 1 }, // 2: out — fed by both a and b
             ],
             connections: vec![((0, 0), (2, 0)), ((1, 0), (2, 0))],
             input_ports: Vec::new(),
@@ -357,14 +367,14 @@ mod tests {
         CircuitTemplate {
             name: "main".to_string(),
             nodes: vec![
-                TemplateNode::InputPin,  // 0: a1
-                TemplateNode::InputPin,  // 1: b1
-                TemplateNode::And,       // 2
-                TemplateNode::OutputPin, // 3: out1
-                TemplateNode::InputPin,  // 4: a2
-                TemplateNode::InputPin,  // 5: b2
-                TemplateNode::And,       // 6
-                TemplateNode::OutputPin, // 7: out2
+                TemplateNode::InputPin { bits: 1 },  // 0: a1
+                TemplateNode::InputPin { bits: 1 },  // 1: b1
+                TemplateNode::And { bits: 1, inputs: 2 },       // 2
+                TemplateNode::OutputPin { bits: 1 }, // 3: out1
+                TemplateNode::InputPin { bits: 1 },  // 4: a2
+                TemplateNode::InputPin { bits: 1 },  // 5: b2
+                TemplateNode::And { bits: 1, inputs: 2 },       // 6
+                TemplateNode::OutputPin { bits: 1 }, // 7: out2
             ],
             connections: vec![
                 ((0, 0), (2, 0)),
@@ -404,9 +414,9 @@ mod tests {
         CircuitTemplate {
             name: "main".to_string(),
             nodes: vec![
-                TemplateNode::InputPin,             // 0: driver (starts off)
+                TemplateNode::InputPin { bits: 1 },             // 0: driver (starts off)
                 TemplateNode::PullResistor(Bit::One), // 1: pull-up
-                TemplateNode::OutputPin,            // 2: out — fed by both
+                TemplateNode::OutputPin { bits: 1 },            // 2: out — fed by both
             ],
             connections: vec![((0, 0), (2, 0)), ((1, 0), (2, 0))],
             input_ports: Vec::new(),
@@ -442,7 +452,7 @@ mod tests {
             "main".to_string(),
             CircuitTemplate {
                 name: "main".to_string(),
-                nodes: vec![TemplateNode::PullResistor(Bit::One), TemplateNode::OutputPin],
+                nodes: vec![TemplateNode::PullResistor(Bit::One), TemplateNode::OutputPin { bits: 1 }],
                 connections: vec![((0, 0), (1, 0))],
                 input_ports: Vec::new(),
                 output_ports: Vec::new(),
@@ -463,10 +473,10 @@ mod tests {
             CircuitTemplate {
                 name: "main".to_string(),
                 nodes: vec![
-                    TemplateNode::InputPin,               // 0: a
-                    TemplateNode::InputPin,               // 1: b
+                    TemplateNode::InputPin { bits: 1 },               // 0: a
+                    TemplateNode::InputPin { bits: 1 },               // 1: b
                     TemplateNode::PullResistor(Bit::One), // 2
-                    TemplateNode::OutputPin,              // 3: out
+                    TemplateNode::OutputPin { bits: 1 },              // 3: out
                 ],
                 connections: vec![((0, 0), (3, 0)), ((1, 0), (3, 0)), ((2, 0), (3, 0))],
                 input_ports: Vec::new(),

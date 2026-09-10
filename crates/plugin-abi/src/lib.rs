@@ -81,6 +81,19 @@ impl Bit {
             Bit::Unknown | Bit::Error => Bit::Error,
         }
     }
+
+    /// Mirrors `Value.xor`'s single-bit case: unlike `and`/`or`, neither
+    /// side is dominant — any `Unknown`/`Error` input makes the result
+    /// `Error` outright (no "one defined input decides it" shortcut).
+    pub fn xor(self, other: Bit) -> Bit {
+        if self == Bit::Error || other == Bit::Error || self == Bit::Unknown || other == Bit::Unknown {
+            Bit::Error
+        } else if self == other {
+            Bit::Zero
+        } else {
+            Bit::One
+        }
+    }
 }
 
 /// One pin's value — a bit vector, width is however many bits that pin is.
@@ -202,6 +215,13 @@ mod tests {
         assert_eq!(One.combine(One), One);
         assert_eq!(One.combine(Zero), Error);
         assert_eq!(Unknown.combine(Unknown), Unknown);
+
+        // `xor`: neither side is dominant — any Unknown/Error input is
+        // Error outright, unlike `and`/`or`'s absorbing-value shortcut.
+        assert_eq!(One.xor(Zero), One);
+        assert_eq!(One.xor(One), Zero);
+        assert_eq!(Zero.xor(Unknown), Error);
+        assert_eq!(One.xor(Error), Error);
     }
 
     #[test]
