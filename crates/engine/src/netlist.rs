@@ -48,6 +48,12 @@ pub enum TemplateNode {
     /// only through `Simulation::tick`.
     Clock { high: u64, low: u64 },
     Register { bits: u8, trigger: Trigger },
+    /// See `Gate::Mux`: input order is data lines, then select, then
+    /// `enable` if `has_enable`.
+    Mux { bits: u8, select_bits: u8, has_enable: bool, disabled_zero: bool },
+    /// See `Gate::Demux`: input order is select, then `enable` if
+    /// `has_enable`, then the one data line; `2^select_bits` outputs.
+    Demux { bits: u8, select_bits: u8, has_enable: bool, disabled_zero: bool, tristate: bool },
     /// Reference to another `CircuitTemplate` by name, resolved during
     /// `flatten`. As a connection endpoint, its pins are numbered
     /// `0..input_ports.len()` for inputs then `input_ports.len()..` for
@@ -236,6 +242,29 @@ fn expand(
                 local_to_global.insert(
                     local_idx,
                     builder.add_gate(Gate::Register { bits: *bits, trigger: *trigger, value: 0, last_clock: Bit::Zero }),
+                );
+            }
+            TemplateNode::Mux { bits, select_bits, has_enable, disabled_zero } => {
+                local_to_global.insert(
+                    local_idx,
+                    builder.add_gate(Gate::Mux {
+                        bits: *bits,
+                        select_bits: *select_bits,
+                        has_enable: *has_enable,
+                        disabled_zero: *disabled_zero,
+                    }),
+                );
+            }
+            TemplateNode::Demux { bits, select_bits, has_enable, disabled_zero, tristate } => {
+                local_to_global.insert(
+                    local_idx,
+                    builder.add_gate(Gate::Demux {
+                        bits: *bits,
+                        select_bits: *select_bits,
+                        has_enable: *has_enable,
+                        disabled_zero: *disabled_zero,
+                        tristate: *tristate,
+                    }),
                 );
             }
             TemplateNode::Subcircuit(sub_name) => {

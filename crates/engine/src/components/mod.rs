@@ -25,6 +25,7 @@
 
 mod logic;
 mod memory;
+mod plexers;
 mod wiring;
 
 pub use memory::Trigger;
@@ -99,6 +100,18 @@ pub enum Gate {
     /// Output is always fully defined (`value` is a plain integer, never
     /// `Unknown`/`Error` itself).
     Register { bits: u8, trigger: Trigger, value: u32, last_clock: Bit },
+    /// `std/plexers/Multiplexer.java`: routes one of `2^select_bits` data
+    /// inputs (input order: data lines, then select, then `enable` if
+    /// `has_enable`) to the single output, chosen by `select`. Stateless —
+    /// see `plexers::eval_plexers` for the enable/select decision tree
+    /// (shared with `Demux`, sverено line-by-line against the Java source).
+    Mux { bits: u8, select_bits: u8, has_enable: bool, disabled_zero: bool },
+    /// `std/plexers/Demultiplexer.java`: routes the single data input
+    /// (input order: select, then `enable` if `has_enable`, then data) to
+    /// one of `2^select_bits` outputs; every *other* output gets `tristate
+    /// ? Unknown : Zero` (Demux's own extra attribute, absent on Mux —
+    /// there's only one output there, nothing to default).
+    Demux { bits: u8, select_bits: u8, has_enable: bool, disabled_zero: bool, tristate: bool },
 }
 
 /// One input pin's bit `i`, or `Unknown` if that pin is unconnected/narrower
@@ -175,6 +188,8 @@ impl Gate {
             | Gate::Xnor { .. }
             | Gate::Buffer { .. } => 1,
             Gate::Register { .. } => 8,
+            // `Plexers.DELAY`, verified in `Plexers.java`.
+            Gate::Mux { .. } | Gate::Demux { .. } => 3,
             Gate::InputPin { .. }
             | Gate::OutputPin { .. }
             | Gate::PullResistor { .. }
@@ -208,6 +223,7 @@ impl Component for Gate {
         match self {
             Gate::Clock { .. } | Gate::Register { .. } => self.input_count_memory(),
             Gate::Constant { .. } | Gate::InputPin { .. } | Gate::OutputPin { .. } | Gate::PullResistor { .. } => self.input_count_wiring(),
+            Gate::Mux { .. } | Gate::Demux { .. } => self.input_count_plexers(),
             _ => self.input_count_logic(),
         }
     }
@@ -215,6 +231,9 @@ impl Component for Gate {
     fn output_count(&self) -> usize {
         match self {
             Gate::OutputPin { .. } => 0,
+            // The only gate kind with more than one output pin — everything
+            // else (including `Mux`) is exactly 1.
+            Gate::Demux { select_bits, .. } => 1usize << select_bits,
             _ => 1,
         }
     }
@@ -223,6 +242,7 @@ impl Component for Gate {
         match self {
             Gate::Clock { .. } | Gate::Register { .. } => self.eval_memory(inputs),
             Gate::Constant { .. } | Gate::InputPin { .. } | Gate::OutputPin { .. } | Gate::PullResistor { .. } => self.eval_wiring(inputs),
+            Gate::Mux { .. } | Gate::Demux { .. } => self.eval_plexers(inputs),
             _ => self.eval_logic(inputs),
         }
     }

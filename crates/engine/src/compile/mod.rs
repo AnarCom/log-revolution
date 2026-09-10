@@ -30,6 +30,7 @@
 
 mod logic;
 mod memory;
+mod plexers;
 mod wiring;
 
 use crate::file_format::{Circuit, ComponentInstance, Facing, ProjectFile};
@@ -59,6 +60,12 @@ pub enum CompileError {
     /// `attrs["trigger"]` isn't one of `StdAttr.TRIGGER`'s own four option
     /// strings (`"rising"`/`"falling"`/`"high"`/`"low"`).
     InvalidTrigger { circuit: String, id: String, value: String },
+    /// `attrs["select"]` outside 1..=5 — `Plexers.ATTR_SELECT`'s own range
+    /// (`Attributes.forBitWidth("select", .., 1, 5)`).
+    InvalidSelectWidth { circuit: String, id: String, value: i64 },
+    /// `attrs["disabled"]` isn't one of `Plexers.ATTR_DISABLED`'s two
+    /// option strings (`"Z"`/`"0"`).
+    InvalidDisabledOption { circuit: String, id: String, value: String },
 }
 
 type Point = (i32, i32);
@@ -200,13 +207,14 @@ pub fn compile(project: &ProjectFile) -> Result<HashMap<String, CircuitTemplate>
 
 /// Tries each category's `compile(type_, ..)` in turn — `None` means "not
 /// mine", so the caller tries the next one; the *last* `None` (none of the
-/// three claimed `type_`) is what makes it a genuinely unknown component
+/// four claimed `type_`) is what makes it a genuinely unknown component
 /// type, distinguishing that from any category's own validation error
 /// (`Some(Err(..))`, e.g. an out-of-range `width`).
 fn compile_leaf(type_: &str, circuit: &Circuit, comp: &ComponentInstance) -> Option<Result<(TemplateNode, Geometry), CompileError>> {
     logic::compile(type_, circuit, comp)
         .or_else(|| wiring::compile(type_, circuit, comp))
         .or_else(|| memory::compile(type_, circuit, comp))
+        .or_else(|| plexers::compile(type_, circuit, comp))
 }
 
 fn compile_circuit(
