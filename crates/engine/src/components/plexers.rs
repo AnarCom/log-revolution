@@ -6,7 +6,7 @@
 //! itself doesn't factor them out (each file repeats the logic), but
 //! there's no reason to duplicate it here too.
 
-use super::{bit_at, Gate};
+use super::{bit_at, u32_to_signal, Gate};
 use plugin_abi::{Bit, Signal};
 
 enum Select {
@@ -75,6 +75,10 @@ impl Gate {
             Gate::Demux { has_enable, .. } => 2 + (*has_enable as usize),
             // select, then enable? — no data line at all, unlike Demux.
             Gate::Decoder { has_enable, .. } => 1 + (*has_enable as usize),
+            // n data lines, then enable_in — always present, unlike the
+            // others' optional `enable` (`PriorityEncoder` has no
+            // no-enable-pin mode in Java).
+            Gate::PriorityEncoder { select_bits, .. } => (1usize << select_bits) + 1,
             _ => unreachable!("dispatch bug: not a plexer"),
         }
     }
@@ -113,6 +117,9 @@ impl Gate {
                     1
                 }
             }
+            // Every data line and `enable_in` are 1 bit each — `PriorityEncoder`
+            // has no wide input pin at all (unlike Mux/Demux/Decoder's select).
+            Gate::PriorityEncoder { .. } => 1,
             _ => unreachable!("dispatch bug: not a plexer"),
         }
     }
@@ -121,11 +128,20 @@ impl Gate {
     /// wide) — except `Decoder`, whose outputs are fixed at 1 bit each
     /// regardless of any `bits` attribute (it doesn't have one: `Decoder`
     /// only ever routes a constant `One`, verified in `Decoder.java`'s
-    /// `propagate`, which hardcodes `BitWidth data = BitWidth.ONE`).
-    pub(super) fn output_width_plexers(&self, _pin: usize) -> u8 {
+    /// `propagate`, which hardcodes `BitWidth data = BitWidth.ONE`), and
+    /// `PriorityEncoder`, whose `out` (pin 0) is `select_bits`-wide but
+    /// `enable_out`/`group_signal` (pins 1, 2) are each 1 bit.
+    pub(super) fn output_width_plexers(&self, pin: usize) -> u8 {
         match self {
             Gate::Mux { bits, .. } | Gate::Demux { bits, .. } => *bits,
             Gate::Decoder { .. } => 1,
+            Gate::PriorityEncoder { select_bits, .. } => {
+                if pin == 0 {
+                    *select_bits
+                } else {
+                    1
+                }
+            }
             _ => unreachable!("dispatch bug: not a plexer"),
         }
     }
@@ -192,6 +208,30 @@ impl Gate {
                 };
 
                 (0..n).map(|i| vec![if Some(i) == selected { Bit::One } else { idle }]).collect()
+            }
+            Gate::PriorityEncoder { select_bits, disabled_zero } => {
+                let n = 1usize << *select_bits;
+                // Deliberately not `enable_status`: `PriorityEncoder.
+                // propagate` uses a plain `!= Value.FALSE` test, so an
+                // `Error` enable counts as active here (unlike Mux/Demux/
+                // Decoder, which special-case it into `Error` outright).
+                let enabled = bit_at(&inputs[n], 0) != Bit::Zero;
+                // Highest index wins; each line is a plain `== One` check
+                // (`Error`/`Unknown` there just means "not asserted", no
+                // per-bit error propagation — verified against `propagate`).
+                let found = if enabled { (0..n).rev().find(|&i| bit_at(&inputs[i], 0) == Bit::One) } else { None };
+
+                match found {
+                    Some(idx) => vec![u32_to_signal(idx as u32, *select_bits), vec![Bit::Zero], vec![Bit::One]],
+                    None => {
+                        // Enabled-but-nothing-found always floats
+                        // (`Value.createUnknown`, ignoring `disabled_zero` —
+                        // that option only governs the *disabled* case).
+                        let out_bit = if !enabled && *disabled_zero { Bit::Zero } else { Bit::Unknown };
+                        let enable_out = if enabled { Bit::One } else { Bit::Zero };
+                        vec![vec![out_bit; *select_bits as usize], vec![enable_out], vec![Bit::Zero]]
+                    }
+                }
             }
             _ => unreachable!("dispatch bug: not a plexer"),
         }
@@ -347,5 +387,53 @@ mod tests {
         // inputs: [select] — no enable pin at all.
         let out = d.eval(&[vec![Bit::Zero]]);
         assert_eq!(out, vec![vec![Bit::One], vec![Bit::Zero]]);
+    }
+
+    fn priority_encoder(select_bits: u8) -> Gate {
+        Gate::PriorityEncoder { select_bits, disabled_zero: false }
+    }
+
+    #[test]
+    fn priority_encoder_picks_the_highest_asserted_index() {
+        let mut p = priority_encoder(2); // 4 data lines
+        // inputs: [i0, i1, i2, i3, enable_in]; i1 and i2 both asserted -> i2 wins.
+        let out = p.eval(&[vec![Bit::Zero], vec![Bit::One], vec![Bit::One], vec![Bit::Zero], vec![Bit::One]]);
+        assert_eq!(out, vec![vec![Bit::Zero, Bit::One], vec![Bit::Zero], vec![Bit::One]], "out=2 (binary 10), enable_out=0, group_signal=1");
+    }
+
+    #[test]
+    fn priority_encoder_nothing_asserted_floats_and_passes_enable_downstream() {
+        let mut p = priority_encoder(1); // 2 data lines
+        let out = p.eval(&[vec![Bit::Zero], vec![Bit::Zero], vec![Bit::One]]);
+        assert_eq!(out, vec![vec![Bit::Unknown], vec![Bit::One], vec![Bit::Zero]]);
+    }
+
+    #[test]
+    fn priority_encoder_disabled_reads_disabled_zero_option_not_the_enabled_default() {
+        let mut p = Gate::PriorityEncoder { select_bits: 1, disabled_zero: true };
+        let out = p.eval(&[vec![Bit::One], vec![Bit::One], vec![Bit::Zero]]); // en=0, both inputs asserted
+        assert_eq!(out, vec![vec![Bit::Zero], vec![Bit::Zero], vec![Bit::Zero]], "disabled -> disabled_zero wins over any asserted input");
+    }
+
+    /// The key divergence from `Mux`/`Demux`/`Decoder`'s `enable_status`:
+    /// there, an `Error` enable is its own conflict branch. Here it's a
+    /// plain `!= Zero` test, so `Error` counts as *active* — verified
+    /// against `PriorityEncoder.propagate`'s `enabled = en != Value.FALSE`.
+    #[test]
+    fn priority_encoder_error_enable_counts_as_active_not_a_conflict() {
+        let mut p = priority_encoder(1);
+        // inputs: [i0, i1, enable_in]; only i1 asserted, enable_in = Error.
+        let out = p.eval(&[vec![Bit::Zero], vec![Bit::One], vec![Bit::Error]]);
+        assert_eq!(out, vec![vec![Bit::One], vec![Bit::Zero], vec![Bit::One]], "i1 wins, same as any other active enable");
+    }
+
+    /// Unlike `Mux`/`Demux`'s select decode, an individual data line's
+    /// `Error`/`Unknown` never propagates — it's simply "not asserted",
+    /// the same as `Zero`.
+    #[test]
+    fn priority_encoder_undefined_data_line_reads_as_not_asserted_not_error() {
+        let mut p = priority_encoder(1);
+        let out = p.eval(&[vec![Bit::Error], vec![Bit::Unknown], vec![Bit::One]]);
+        assert_eq!(out, vec![vec![Bit::Unknown], vec![Bit::One], vec![Bit::Zero]], "neither line reads as asserted -> nothing found");
     }
 }

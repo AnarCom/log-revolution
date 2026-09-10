@@ -1,5 +1,5 @@
 //! Compiles the sources/sinks/pull resistor: Constant/InputPin/OutputPin/
-//! PullResistor/Ground/Power.
+//! PullResistor/Ground/Power/LED/Button/BitExtender.
 //!
 //! `Ground`/`Power` aren't their own runtime node kind — both are exactly a
 //! fixed-value source (`Ground.propagate`/`Power.propagate`, verified: each
@@ -7,8 +7,19 @@
 //! shape as `Constant.propagate`'s `setPort(0, Value.createKnown(width,
 //! value), 1)`), so they compile straight to `TemplateNode::Constant` with
 //! `value` fixed at `0`/all-ones instead of read from an attribute.
+//!
+//! `LED`/`Button` (`std/io/Led.java`/`Button.java`) aren't new node kinds
+//! either: `Led.propagate` just stores whatever its one 1-bit input reads
+//! (a `Logger`/painter can see it later) — exactly `OutputPin`'s own
+//! `eval_wiring` behavior, fixed at 1 bit (real `LED` has no `width`
+//! attribute at all). `Button.propagate` reads `state.setPort(0, val, 1)`
+//! from internal "is it currently pressed" data that a `Poker` flips
+//! `TRUE`/`FALSE` on press/release — exactly `InputPin { bits: 1 }`'s
+//! existing `on`/`off` actions (verified: both default to `Value.FALSE`
+//! absent any interaction, same as `InputPin`'s own zeroed initial value).
 
 use super::{sink_geometry, source_geometry, width_attr, CompileError, Geometry};
+use crate::components::ExtendMode;
 use crate::file_format::{Circuit, ComponentInstance};
 use crate::netlist::TemplateNode;
 use plugin_abi::Bit;
@@ -44,6 +55,50 @@ fn all_ones(bits: u8) -> u32 {
     }
 }
 
+/// `attrs["in_width"]`/`attrs["out_width"]` for `core:BitExtender` —
+/// `BitExtender.java`'s own attribute names (`ATTR_IN_WIDTH`/
+/// `ATTR_OUT_WIDTH`) and defaults (8/16, not the usual `width_attr`
+/// default of 1).
+fn in_width_attr(circuit: &Circuit, comp: &ComponentInstance) -> Result<u8, CompileError> {
+    let raw = comp.attrs.get("in_width").and_then(|v| v.as_i64()).unwrap_or(8);
+    if (1..=32).contains(&raw) {
+        Ok(raw as u8)
+    } else {
+        Err(CompileError::InvalidWidth { circuit: circuit.name.clone(), id: comp.id.clone(), value: raw })
+    }
+}
+
+fn out_width_attr(circuit: &Circuit, comp: &ComponentInstance) -> Result<u8, CompileError> {
+    let raw = comp.attrs.get("out_width").and_then(|v| v.as_i64()).unwrap_or(16);
+    if (1..=32).contains(&raw) {
+        Ok(raw as u8)
+    } else {
+        Err(CompileError::InvalidWidth { circuit: circuit.name.clone(), id: comp.id.clone(), value: raw })
+    }
+}
+
+fn extend_mode_attr(circuit: &Circuit, comp: &ComponentInstance) -> Result<ExtendMode, CompileError> {
+    let raw = comp.attrs.get("type").and_then(|v| v.as_str()).unwrap_or("zero");
+    match raw {
+        "zero" => Ok(ExtendMode::Zero),
+        "one" => Ok(ExtendMode::One),
+        "sign" => Ok(ExtendMode::Sign),
+        "input" => Ok(ExtendMode::Input),
+        other => Err(CompileError::InvalidExtendType { circuit: circuit.name.clone(), id: comp.id.clone(), value: other.to_string() }),
+    }
+}
+
+/// `in` dead center, optional `extend` control pin (only `mode == Input`)
+/// tucked at `(0, -2)`, `out` two units east — matches `Gate::
+/// BitExtender`'s expected input order (`in`, `extend?`).
+fn bit_extender_geometry(has_extend_pin: bool) -> Geometry {
+    let mut inputs = vec![(0, 0)];
+    if has_extend_pin {
+        inputs.push((0, -2));
+    }
+    Geometry { inputs, outputs: vec![(2, 0)] }
+}
+
 pub(super) fn compile(type_: &str, circuit: &Circuit, comp: &ComponentInstance) -> Option<Result<(TemplateNode, Geometry), CompileError>> {
     Some(match type_ {
         "core:Constant" => {
@@ -54,6 +109,14 @@ pub(super) fn compile(type_: &str, circuit: &Circuit, comp: &ComponentInstance) 
         "core:InputPin" => width_attr(circuit, comp).map(|bits| (TemplateNode::InputPin { bits }, source_geometry())),
         "core:OutputPin" => width_attr(circuit, comp).map(|bits| (TemplateNode::OutputPin { bits }, sink_geometry())),
         "core:PullResistor" => pull_target(circuit, comp).map(|to| (TemplateNode::PullResistor(to), source_geometry())),
+        "core:LED" => Ok((TemplateNode::OutputPin { bits: 1 }, sink_geometry())),
+        "core:Button" => Ok((TemplateNode::InputPin { bits: 1 }, source_geometry())),
+        "core:BitExtender" => (|| {
+            let in_bits = in_width_attr(circuit, comp)?;
+            let out_bits = out_width_attr(circuit, comp)?;
+            let mode = extend_mode_attr(circuit, comp)?;
+            Ok((TemplateNode::BitExtender { in_bits, out_bits, mode }, bit_extender_geometry(mode == ExtendMode::Input)))
+        })(),
         _ => return None,
     })
 }
@@ -66,7 +129,7 @@ mod tests {
     use crate::netlist::flatten;
     use crate::netlist::TemplateNode as Node;
     use crate::sim::Simulation;
-    use plugin_abi::Bit;
+    use plugin_abi::{Bit, Value};
     use serde_json::json;
     use std::collections::BTreeMap;
 
@@ -164,5 +227,92 @@ mod tests {
         let mut sim = Simulation::new(netlist);
         sim.run_to_quiescence();
         assert_eq!(get_bits(&sim, 1), vec![Bit::One; 32]);
+    }
+
+    /// `LED` compiles straight to `TemplateNode::OutputPin { bits: 1 }`
+    /// (see this module's doc comment) — reads its own `"get"` readout
+    /// directly, same as any `OutputPin`.
+    #[test]
+    fn led_reflects_its_driven_input() {
+        let project = single_circuit_project(Circuit {
+            name: "main".to_string(),
+            components: vec![comp("in", "core:InputPin", 0, 0), comp("led", "core:LED", 3, 0)],
+            wires: vec![wire("w1", [0, 0], [3, 0])],
+            annotations: vec![],
+        });
+        let library = compile(&project).unwrap();
+        let netlist = flatten(&project.main_circuit, &library).unwrap();
+        let mut sim = Simulation::new(netlist);
+        sim.run_to_quiescence();
+        assert_eq!(get_bit(&sim, 1), Bit::Zero);
+
+        sim.invoke(0, "on", None).unwrap();
+        sim.run_to_quiescence();
+        assert_eq!(get_bit(&sim, 1), Bit::One);
+    }
+
+    /// `Button` compiles straight to `TemplateNode::InputPin { bits: 1 }`
+    /// (see this module's doc comment) — driven through an `OutputPin` to
+    /// prove it behaves as a real source, not just inspecting the node.
+    #[test]
+    fn button_acts_as_a_momentary_one_bit_source() {
+        let project = single_circuit_project(Circuit {
+            name: "main".to_string(),
+            components: vec![comp("btn", "core:Button", 0, 0), comp("out", "core:OutputPin", 3, 0)],
+            wires: vec![wire("w1", [0, 0], [3, 0])],
+            annotations: vec![],
+        });
+        let library = compile(&project).unwrap();
+        let netlist = flatten(&project.main_circuit, &library).unwrap();
+        let mut sim = Simulation::new(netlist);
+        sim.run_to_quiescence();
+        assert_eq!(get_bit(&sim, 1), Bit::Zero, "unpressed defaults to Zero, same as Button.propagate's Value.FALSE default");
+
+        sim.invoke(0, "on", None).unwrap(); // press
+        sim.run_to_quiescence();
+        assert_eq!(get_bit(&sim, 1), Bit::One);
+
+        sim.invoke(0, "off", None).unwrap(); // release
+        sim.run_to_quiescence();
+        assert_eq!(get_bit(&sim, 1), Bit::Zero);
+    }
+
+    /// `in`/`extend`/`out` -> `BitExtender`'s two inputs and output —
+    /// placed to coincide exactly with `bit_extender_geometry(true)`'s
+    /// offsets relative to the extender at `(0,0)`.
+    #[test]
+    fn compiles_and_simulates_a_bit_extender_in_input_mode() {
+        let mut in4 = BTreeMap::new();
+        in4.insert("width".to_string(), json!(4));
+        let mut ext_attrs = BTreeMap::new();
+        ext_attrs.insert("in_width".to_string(), json!(4));
+        ext_attrs.insert("out_width".to_string(), json!(8));
+        ext_attrs.insert("type".to_string(), json!("input"));
+        let mut out8 = BTreeMap::new();
+        out8.insert("width".to_string(), json!(8));
+
+        let project = single_circuit_project(Circuit {
+            name: "main".to_string(),
+            components: vec![
+                ComponentInstance { attrs: in4, ..comp("data", "core:InputPin", 0, 0) },
+                comp("extend", "core:InputPin", 0, -2),
+                ComponentInstance { attrs: ext_attrs, ..comp("ext", "core:BitExtender", 0, 0) },
+                ComponentInstance { attrs: out8, ..comp("out", "core:OutputPin", 2, 0) },
+            ],
+            wires: vec![wire("w1", [0, 0], [0, 0]), wire("w2", [0, -2], [0, -2]), wire("w3", [2, 0], [2, 0])],
+            annotations: vec![],
+        });
+        let library = compile(&project).unwrap();
+        let netlist = flatten(&project.main_circuit, &library).unwrap();
+        let mut sim = Simulation::new(netlist);
+
+        sim.invoke(0, "set", Some(Value::Int(0b0110))).unwrap(); // data
+        sim.invoke(1, "on", None).unwrap(); // extend = 1
+        sim.run_to_quiescence();
+        assert_eq!(
+            get_bits(&sim, 3),
+            vec![Bit::Zero, Bit::One, Bit::One, Bit::Zero, Bit::One, Bit::One, Bit::One, Bit::One],
+            "low 4 bits are `data`, high 4 filled with `extend`'s current value"
+        );
     }
 }

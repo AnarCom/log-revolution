@@ -20,7 +20,7 @@
 //! usable whether or not the circuit they're in is ever used as a
 //! subcircuit.
 
-use crate::components::{Gate, Trigger};
+use crate::components::{ExtendMode, Gate, Trigger};
 use plugin_abi::Bit;
 use std::collections::HashMap;
 
@@ -54,6 +54,9 @@ pub enum TemplateNode {
     /// it — see `Gate::PullResistor` for why it's wired in like a normal
     /// driver but resolved specially.
     PullResistor(Bit),
+    /// See `Gate::BitExtender`: input order is `in`, then `extend` if
+    /// `mode == Input`.
+    BitExtender { in_bits: u8, out_bits: u8, mode: ExtendMode },
     /// See `Gate::Clock`'s doc comment: `high`/`low` are the period
     /// attributes, not an independent timer — actual advancement happens
     /// only through `Simulation::tick`.
@@ -68,6 +71,10 @@ pub enum TemplateNode {
     /// See `Gate::Decoder`: input order is select, then `enable` if
     /// `has_enable`; `2^select_bits` 1-bit outputs, no data input.
     Decoder { select_bits: u8, has_enable: bool, disabled_zero: bool, tristate: bool },
+    /// See `Gate::PriorityEncoder`: input order is `2^select_bits` data
+    /// lines then `enable_in`; output order is `out`, `enable_out`,
+    /// `group_signal`.
+    PriorityEncoder { select_bits: u8, disabled_zero: bool },
     /// See `Gate::Adder`: inputs `in0`, `in1`, `c_in`; outputs `sum`, `c_out`.
     Adder { bits: u8 },
     /// See `Gate::Subtractor`: inputs `in0`, `in1`, `b_in`; outputs `diff`,
@@ -147,6 +154,14 @@ impl TemplateNode {
                     1
                 }
             }
+            TemplateNode::PriorityEncoder { .. } => 1,
+            TemplateNode::BitExtender { in_bits, .. } => {
+                if pin == 0 {
+                    *in_bits
+                } else {
+                    1
+                }
+            }
             TemplateNode::Adder { bits } | TemplateNode::Subtractor { bits } => {
                 if pin < 2 {
                     *bits
@@ -182,6 +197,14 @@ impl TemplateNode {
             TemplateNode::Register { bits, .. } => *bits,
             TemplateNode::Mux { bits, .. } | TemplateNode::Demux { bits, .. } => *bits,
             TemplateNode::Decoder { .. } => 1,
+            TemplateNode::PriorityEncoder { select_bits, .. } => {
+                if pin == 0 {
+                    *select_bits
+                } else {
+                    1
+                }
+            }
+            TemplateNode::BitExtender { out_bits, .. } => *out_bits,
             TemplateNode::Adder { bits } | TemplateNode::Subtractor { bits } => {
                 if pin == 0 {
                     *bits
@@ -391,6 +414,9 @@ fn expand(
             TemplateNode::PullResistor(to) => {
                 local_to_global.insert(local_idx, builder.add_gate(Gate::PullResistor { to: *to }));
             }
+            TemplateNode::BitExtender { in_bits, out_bits, mode } => {
+                local_to_global.insert(local_idx, builder.add_gate(Gate::BitExtender { in_bits: *in_bits, out_bits: *out_bits, mode: *mode }));
+            }
             TemplateNode::Clock { high, low } => {
                 local_to_global.insert(
                     local_idx,
@@ -436,6 +462,9 @@ fn expand(
                         tristate: *tristate,
                     }),
                 );
+            }
+            TemplateNode::PriorityEncoder { select_bits, disabled_zero } => {
+                local_to_global.insert(local_idx, builder.add_gate(Gate::PriorityEncoder { select_bits: *select_bits, disabled_zero: *disabled_zero }));
             }
             TemplateNode::Adder { bits } => {
                 local_to_global.insert(local_idx, builder.add_gate(Gate::Adder { bits: *bits }));

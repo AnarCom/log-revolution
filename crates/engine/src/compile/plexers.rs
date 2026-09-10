@@ -1,5 +1,5 @@
-//! Compiles the multiplexer/demultiplexer/decoder: Multiplexer/
-//! Demultiplexer/Decoder.
+//! Compiles the multiplexer/demultiplexer/decoder/priority encoder:
+//! Multiplexer/Demultiplexer/Decoder/PriorityEncoder.
 //!
 //! Attribute keys/defaults match `Plexers.java` verbatim: `"select"`
 //! (`ATTR_SELECT`, `BitWidth` 1..=5, default 1), `"enable"` (`ATTR_ENABLE`,
@@ -76,6 +76,15 @@ fn decoder_geometry(n: usize, has_enable: bool) -> Geometry {
     Geometry { inputs, outputs }
 }
 
+/// `n` data lines stacked down the west edge, `enable_in` just past them —
+/// matches `Gate::PriorityEncoder`'s expected input order (data.., enable);
+/// the three outputs (`out`, `enable_out`, `group_signal`) on the east.
+fn priority_encoder_geometry(n: usize) -> Geometry {
+    let mut inputs: Vec<(i32, i32)> = (0..n).map(|i| (0, 2 * i as i32)).collect();
+    inputs.push((0, 2 * n as i32)); // enable_in
+    Geometry { inputs, outputs: vec![(3, 0), (3, 2), (3, 4)] }
+}
+
 pub(super) fn compile(type_: &str, circuit: &Circuit, comp: &ComponentInstance) -> Option<Result<(TemplateNode, Geometry), CompileError>> {
     let result = match type_ {
         "core:Multiplexer" => (|| {
@@ -102,6 +111,12 @@ pub(super) fn compile(type_: &str, circuit: &Circuit, comp: &ComponentInstance) 
             let tristate = tristate_attr(comp);
             let n = 1usize << select_bits;
             Ok((TemplateNode::Decoder { select_bits, has_enable, disabled_zero, tristate }, decoder_geometry(n, has_enable)))
+        })(),
+        "core:PriorityEncoder" => (|| {
+            let select_bits = select_attr(circuit, comp)?;
+            let disabled_zero = disabled_zero_attr(circuit, comp)?;
+            let n = 1usize << select_bits;
+            Ok((TemplateNode::PriorityEncoder { select_bits, disabled_zero }, priority_encoder_geometry(n)))
         })(),
         _ => return None,
     };
@@ -286,5 +301,44 @@ mod tests {
         sim.run_to_quiescence();
         assert_eq!(get_bit(&sim, 2), Bit::Zero, "o0 now idles");
         assert_eq!(get_bit(&sim, 3), Bit::One, "o1 asserted");
+    }
+
+    /// `i0`/`i1` -> PriorityEncoder's two data lines, `en` -> enable_in,
+    /// `out`/`eout`/`gs` read the three outputs — placed to coincide
+    /// exactly with `priority_encoder_geometry(2)`'s offsets relative to
+    /// the encoder at `(0,0)`.
+    #[test]
+    fn compiles_and_simulates_a_priority_encoder() {
+        let project = single_circuit_project(Circuit {
+            name: "main".to_string(),
+            components: vec![
+                comp("i0", "core:InputPin", 0, 0),
+                comp("i1", "core:InputPin", 0, 2),
+                comp("en", "core:InputPin", 0, 4),
+                comp("pe", "core:PriorityEncoder", 0, 0),
+                comp("out", "core:OutputPin", 3, 0),
+                comp("eout", "core:OutputPin", 3, 2),
+                comp("gs", "core:OutputPin", 3, 4),
+            ],
+            wires: vec![
+                wire("w1", [0, 0], [0, 0]),
+                wire("w2", [0, 2], [0, 2]),
+                wire("w3", [0, 4], [0, 4]),
+                wire("w4", [3, 0], [3, 0]),
+                wire("w5", [3, 2], [3, 2]),
+                wire("w6", [3, 4], [3, 4]),
+            ],
+            annotations: vec![],
+        });
+        let library = compile(&project).unwrap();
+        let netlist = flatten(&project.main_circuit, &library).unwrap();
+        let mut sim = Simulation::new(netlist);
+
+        sim.invoke(2, "on", None).unwrap(); // enable
+        sim.invoke(1, "on", None).unwrap(); // i1
+        sim.run_to_quiescence();
+        assert_eq!(get_bit(&sim, 4), Bit::One, "out=1");
+        assert_eq!(get_bit(&sim, 5), Bit::Zero, "enable_out=0 (found something)");
+        assert_eq!(get_bit(&sim, 6), Bit::One, "group_signal=1");
     }
 }

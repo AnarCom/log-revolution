@@ -30,6 +30,7 @@ mod plexers;
 mod wiring;
 
 pub use memory::Trigger;
+pub use wiring::ExtendMode;
 
 use plugin_abi::{ActionError, Bit, Component, ReadoutError, Signal, Value};
 
@@ -86,6 +87,15 @@ pub enum Gate {
     /// inference we don't have yet (deferred, PLAN.md §14) — a pull
     /// resistor on a wide bus should be modeled per-bit externally for now.
     PullResistor { to: Bit },
+    /// `std/wiring/BitExtender.java`: resizes `in` (`in_bits`-wide) to
+    /// `out_bits`-wide. `out_bits <= in_bits` truncates (keeps the low
+    /// bits); `out_bits > in_bits` appends `mode`-derived high bits —
+    /// `Zero`/`One` fill with that fixed bit, `Sign` repeats `in`'s own
+    /// MSB, `Input` repeats a second 1-bit control pin's current value
+    /// (that pin only exists when `mode == Input`, verified against
+    /// `BitExtender.propagate`/`configurePorts`). Input order: `in`, then
+    /// `extend` if `mode == Input`.
+    BitExtender { in_bits: u8, out_bits: u8, mode: ExtendMode },
     /// A square-wave source — but *not* its own independent timer. Real
     /// Logisim has exactly one global tick counter for the whole
     /// simulation (`Propagator.ticks`); every `Clock` instance is a pure
@@ -132,6 +142,21 @@ pub enum Gate {
     /// `Demux` (`Plexers.java`'s shared convention, not reimplemented here
     /// — see `plexers::eval_plexers`'s `decode_select`/`enable_status`).
     Decoder { select_bits: u8, has_enable: bool, disabled_zero: bool, tristate: bool },
+    /// `std/plexers/PriorityEncoder.java`: `2^select_bits` single-bit data
+    /// inputs (index `n` is `enable_in`), checked from the *highest* index
+    /// down — priority to the higher-numbered line, first `One` wins.
+    /// Outputs: `out` (`select_bits`-wide winning index, or floating/
+    /// `disabled_zero` when nothing won), `enable_out` (cascades to a
+    /// chained stage: `One` only when this stage is enabled but found
+    /// nothing), `group_signal` (`One` iff this stage found something).
+    /// Deliberately simpler enable/data checks than `Mux`/`Demux`/
+    /// `Decoder`'s `enable_status`/`decode_select` — verified against
+    /// `propagate`: `enabled = en != Value.FALSE` (so an `Error` enable
+    /// counts as active, unlike those, which special-case it into its own
+    /// conflict branch), and each data line is a plain `== Value.TRUE`
+    /// check (`Error`/`Unknown` there just reads as "not asserted", no
+    /// per-bit error propagation at all).
+    PriorityEncoder { select_bits: u8, disabled_zero: bool },
     /// `std/arith/Adder.java`: `in0 + in1 + c_in`, bit-serial (see
     /// `arithmetic::ripple_carry_add` for why — not a native-int port of
     /// the Java fast path). Input order: `in0`, `in1`, `c_in`; output
@@ -239,10 +264,18 @@ impl Gate {
             // `GateAttributes.DELAY`, same constant `ControlledBuffer.java`
             // itself uses (`GateAttributes.DELAY`, verified in its own
             // `propagate`).
-            | Gate::ControlledBuffer { .. } => 1,
+            | Gate::ControlledBuffer { .. }
+            // `state.setPort(0, out, 1)`, verified in `BitExtender.
+            // propagate` — also required by this method's own invariant
+            // (nonzero delay for anything downstream of another gate in the
+            // same instant): unlike `Constant`/`InputPin`, `BitExtender`
+            // has a real input, so it can genuinely be fed within the same
+            // batch.
+            | Gate::BitExtender { .. } => 1,
             Gate::Register { .. } => 8,
-            // `Plexers.DELAY`, verified in `Plexers.java`/`Decoder.java`.
-            Gate::Mux { .. } | Gate::Demux { .. } | Gate::Decoder { .. } => 3,
+            // `Plexers.DELAY`, verified in `Plexers.java`/`Decoder.java`/
+            // `PriorityEncoder.java`.
+            Gate::Mux { .. } | Gate::Demux { .. } | Gate::Decoder { .. } | Gate::PriorityEncoder { .. } => 3,
             Gate::InputPin { .. }
             | Gate::OutputPin { .. }
             | Gate::PullResistor { .. }
@@ -286,8 +319,10 @@ impl Gate {
     pub fn input_width(&self, pin: usize) -> u8 {
         match self {
             Gate::Clock { .. } | Gate::Register { .. } => self.input_width_memory(pin),
-            Gate::Constant { .. } | Gate::InputPin { .. } | Gate::OutputPin { .. } | Gate::PullResistor { .. } => self.input_width_wiring(pin),
-            Gate::Mux { .. } | Gate::Demux { .. } | Gate::Decoder { .. } => self.input_width_plexers(pin),
+            Gate::Constant { .. } | Gate::InputPin { .. } | Gate::OutputPin { .. } | Gate::PullResistor { .. } | Gate::BitExtender { .. } => {
+                self.input_width_wiring(pin)
+            }
+            Gate::Mux { .. } | Gate::Demux { .. } | Gate::Decoder { .. } | Gate::PriorityEncoder { .. } => self.input_width_plexers(pin),
             Gate::Adder { .. } | Gate::Subtractor { .. } | Gate::Comparator { .. } | Gate::Multiplier { .. } | Gate::Divider { .. } => self.input_width_arithmetic(pin),
             _ => self.input_width_logic(pin),
         }
@@ -299,8 +334,10 @@ impl Gate {
     pub fn output_width(&self, pin: usize) -> u8 {
         match self {
             Gate::Clock { .. } | Gate::Register { .. } => self.output_width_memory(pin),
-            Gate::Constant { .. } | Gate::InputPin { .. } | Gate::OutputPin { .. } | Gate::PullResistor { .. } => self.output_width_wiring(pin),
-            Gate::Mux { .. } | Gate::Demux { .. } | Gate::Decoder { .. } => self.output_width_plexers(pin),
+            Gate::Constant { .. } | Gate::InputPin { .. } | Gate::OutputPin { .. } | Gate::PullResistor { .. } | Gate::BitExtender { .. } => {
+                self.output_width_wiring(pin)
+            }
+            Gate::Mux { .. } | Gate::Demux { .. } | Gate::Decoder { .. } | Gate::PriorityEncoder { .. } => self.output_width_plexers(pin),
             Gate::Adder { .. } | Gate::Subtractor { .. } | Gate::Comparator { .. } | Gate::Multiplier { .. } | Gate::Divider { .. } => self.output_width_arithmetic(pin),
             _ => self.output_width_logic(pin),
         }
@@ -322,8 +359,10 @@ impl Component for Gate {
     fn input_count(&self) -> usize {
         match self {
             Gate::Clock { .. } | Gate::Register { .. } => self.input_count_memory(),
-            Gate::Constant { .. } | Gate::InputPin { .. } | Gate::OutputPin { .. } | Gate::PullResistor { .. } => self.input_count_wiring(),
-            Gate::Mux { .. } | Gate::Demux { .. } | Gate::Decoder { .. } => self.input_count_plexers(),
+            Gate::Constant { .. } | Gate::InputPin { .. } | Gate::OutputPin { .. } | Gate::PullResistor { .. } | Gate::BitExtender { .. } => {
+                self.input_count_wiring()
+            }
+            Gate::Mux { .. } | Gate::Demux { .. } | Gate::Decoder { .. } | Gate::PriorityEncoder { .. } => self.input_count_plexers(),
             Gate::Adder { .. } | Gate::Subtractor { .. } | Gate::Comparator { .. } | Gate::Multiplier { .. } | Gate::Divider { .. } => self.input_count_arithmetic(),
             _ => self.input_count_logic(),
         }
@@ -337,6 +376,7 @@ impl Component for Gate {
             Gate::Demux { select_bits, .. } | Gate::Decoder { select_bits, .. } => 1usize << select_bits,
             Gate::Adder { .. } | Gate::Subtractor { .. } | Gate::Multiplier { .. } | Gate::Divider { .. } => 2, // sum/diff, carry/borrow-out
             Gate::Comparator { .. } => 3,                      // gt, eq, lt
+            Gate::PriorityEncoder { .. } => 3,                 // out, enable_out, group_signal
             _ => 1,
         }
     }
@@ -344,8 +384,10 @@ impl Component for Gate {
     fn eval(&mut self, inputs: &[Signal]) -> Vec<Signal> {
         match self {
             Gate::Clock { .. } | Gate::Register { .. } => self.eval_memory(inputs),
-            Gate::Constant { .. } | Gate::InputPin { .. } | Gate::OutputPin { .. } | Gate::PullResistor { .. } => self.eval_wiring(inputs),
-            Gate::Mux { .. } | Gate::Demux { .. } | Gate::Decoder { .. } => self.eval_plexers(inputs),
+            Gate::Constant { .. } | Gate::InputPin { .. } | Gate::OutputPin { .. } | Gate::PullResistor { .. } | Gate::BitExtender { .. } => {
+                self.eval_wiring(inputs)
+            }
+            Gate::Mux { .. } | Gate::Demux { .. } | Gate::Decoder { .. } | Gate::PriorityEncoder { .. } => self.eval_plexers(inputs),
             Gate::Adder { .. } | Gate::Subtractor { .. } | Gate::Comparator { .. } | Gate::Multiplier { .. } | Gate::Divider { .. } => self.eval_arithmetic(inputs),
             _ => self.eval_logic(inputs),
         }

@@ -106,6 +106,9 @@ pub enum CompileError {
     /// `compile/splitter.rs`) has the wrong length or an out-of-range
     /// entry.
     InvalidSplitterBits { circuit: String, id: String, reason: String },
+    /// `attrs["type"]` for `core:BitExtender` isn't one of `BitExtender.
+    /// java`'s own four option strings (`"zero"`/`"one"`/`"sign"`/`"input"`).
+    InvalidExtendType { circuit: String, id: String, value: String },
 }
 
 type Point = (i32, i32);
