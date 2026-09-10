@@ -38,9 +38,7 @@ impl Bit {
     pub fn combine(self, other: Bit) -> Bit {
         if self == Bit::Unknown {
             other
-        } else if other == Bit::Unknown {
-            self
-        } else if self == other {
+        } else if other == Bit::Unknown || self == other {
             self
         } else {
             Bit::Error
@@ -71,17 +69,6 @@ impl Bit {
         }
     }
 
-    /// Mirrors `Value.not`: undefined input stays undefined-as-error, not
-    /// `Unknown` — matches the reference implementation exactly rather
-    /// than guessing at "nicer" behavior.
-    pub fn not(self) -> Bit {
-        match self {
-            Bit::One => Bit::Zero,
-            Bit::Zero => Bit::One,
-            Bit::Unknown | Bit::Error => Bit::Error,
-        }
-    }
-
     /// Mirrors `Value.xor`'s single-bit case: unlike `and`/`or`, neither
     /// side is dominant — any `Unknown`/`Error` input makes the result
     /// `Error` outright (no "one defined input decides it" shortcut).
@@ -92,6 +79,23 @@ impl Bit {
             Bit::Zero
         } else {
             Bit::One
+        }
+    }
+
+    /// Mirrors `Value.not`: undefined input stays undefined-as-error, not
+    /// `Unknown` — matches the reference implementation exactly rather
+    /// than guessing at "nicer" behavior. Kept as a plain inherent method,
+    /// not `impl std::ops::Not` — every `.not()` call site across the
+    /// engine would otherwise need its own `use std::ops::Not;` for method
+    /// resolution to find it, for a rename that buys nothing here (nothing
+    /// uses `!bit` operator syntax, and `Bit::not` already reads clearly at
+    /// every call site).
+    #[allow(clippy::should_implement_trait)]
+    pub fn not(self) -> Bit {
+        match self {
+            Bit::One => Bit::Zero,
+            Bit::Zero => Bit::One,
+            Bit::Unknown | Bit::Error => Bit::Error,
         }
     }
 }

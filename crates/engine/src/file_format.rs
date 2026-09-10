@@ -140,6 +140,5 @@ mod tests {
         });
         let parsed: ProjectFile = serde_json::from_value(minimal).unwrap();
         assert!(parsed.circuits[0].components.is_empty());
-        assert_eq!(parsed.circuits[0].components.first().is_none(), true);
     }
 }

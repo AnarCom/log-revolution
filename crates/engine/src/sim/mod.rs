@@ -109,8 +109,8 @@ impl Simulation {
         // depth guarantees every gate's *first* eval only ever reads
         // already-committed (real, not placeholder) values from whatever
         // feeds it directly.
-        for idx in 0..sim.netlist.gates.len() {
-            sim.queue.push(Event { time: priming_depth[idx], gate: idx });
+        for (idx, &depth) in priming_depth.iter().enumerate() {
+            sim.queue.push(Event { time: depth, gate: idx });
         }
         sim
     }

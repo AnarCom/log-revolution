@@ -139,7 +139,7 @@ fn parse_statement(line: &str, line_no: usize) -> Result<Statement, ParseError> 
 /// the id, the identifier immediately after `->` (action or readout name),
 /// and whatever trails after *that* identifier — an assert's `<cmp> <value>`,
 /// or an action's optional `(<value>)`.
-fn parse_component_arrow<'a>(input: &'a str, line_no: usize) -> Result<(String, &'a str, &'a str), ParseError> {
+fn parse_component_arrow(input: &str, line_no: usize) -> Result<(String, &str, &str), ParseError> {
     let err = |message: &str| ParseError { line: line_no, message: message.to_string() };
 
     let input = input.trim();
