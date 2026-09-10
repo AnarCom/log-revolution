@@ -19,6 +19,7 @@
 //! matching Logisim's names now means the `.circ` importer (PLAN.md §9)
 //! won't need a translation table for them later.
 
+use crate::components::Trigger;
 use crate::file_format::{Circuit, ComponentInstance, Facing, ProjectFile};
 use crate::netlist::{CircuitTemplate, PinRef, TemplateNode};
 use plugin_abi::Bit;
@@ -40,6 +41,13 @@ pub enum CompileError {
     /// `ATTR_INPUTS`'s own range (a gate needs at least 2 inputs to mean
     /// anything, and Logisim caps it at 32 same as bit width).
     InvalidInputCount { circuit: String, id: String, value: i64 },
+    /// `attrs["highDuration"]`/`attrs["lowDuration"]` below 1 —
+    /// `Clock.ATTR_HIGH`/`ATTR_LOW`'s own `DurationAttribute` range (a
+    /// clock phase lasting zero ticks is meaningless).
+    InvalidClockDuration { circuit: String, id: String, field: &'static str, value: i64 },
+    /// `attrs["trigger"]` isn't one of `StdAttr.TRIGGER`'s own four option
+    /// strings (`"rising"`/`"falling"`/`"high"`/`"low"`).
+    InvalidTrigger { circuit: String, id: String, value: String },
 }
 
 type Point = (i32, i32);
@@ -80,6 +88,18 @@ fn variadic_gate_geometry(inputs: usize) -> Geometry {
     Geometry {
         inputs: (0..inputs).map(|i| (0, 2 * i as i32 - (n - 1))).collect(),
         outputs: vec![(3, 0)],
+    }
+}
+
+/// `Register`'s 4 fixed inputs, in the exact order `components.rs::eval`
+/// expects them (`d`, `ck`, `clr`, `en` — see `Gate::input_count`'s doc):
+/// D on the west side, the three control pins spread along the south edge
+/// (matches `Register.java`'s own port layout in spirit, not pixel-for-
+/// pixel — nothing renders this yet). Output Q on the east side.
+fn register_geometry() -> Geometry {
+    Geometry {
+        inputs: vec![(0, 0), (1, 2), (2, 2), (3, 2)], // d, ck, clr, en
+        outputs: vec![(4, 0)],
     }
 }
 
@@ -199,6 +219,35 @@ fn value_attr(comp: &ComponentInstance) -> u32 {
     comp.attrs.get("value").and_then(|v| v.as_i64()).unwrap_or(0) as u32
 }
 
+/// `attrs["highDuration"]`/`attrs["lowDuration"]` for `core:Clock` —
+/// defaulting to 1 each, same as `Clock.ATTR_HIGH`/`ATTR_LOW`'s own
+/// defaults (`Integer.valueOf(1)` in the Java constructor). Must be >= 1
+/// (`DurationAttribute`'s own range); no upper bound, matching Java's
+/// `Integer.MAX_VALUE` ceiling closely enough that rejecting on overflow
+/// into `i64` isn't worth the complexity here.
+fn clock_duration_attr(circuit: &Circuit, comp: &ComponentInstance, key: &'static str) -> Result<u64, CompileError> {
+    let raw = comp.attrs.get(key).and_then(|v| v.as_i64()).unwrap_or(1);
+    if raw >= 1 {
+        Ok(raw as u64)
+    } else {
+        Err(CompileError::InvalidClockDuration { circuit: circuit.name.clone(), id: comp.id.clone(), field: key, value: raw })
+    }
+}
+
+/// `attrs["trigger"]` for `core:Register` — `StdAttr.TRIGGER`'s own option
+/// strings, defaulting to `"rising"` (`StdAttr.TRIG_RISING`, `Register`'s
+/// own default).
+fn trigger_attr(circuit: &Circuit, comp: &ComponentInstance) -> Result<Trigger, CompileError> {
+    let raw = comp.attrs.get("trigger").and_then(|v| v.as_str()).unwrap_or("rising");
+    match raw {
+        "rising" => Ok(Trigger::Rising),
+        "falling" => Ok(Trigger::Falling),
+        "high" => Ok(Trigger::High),
+        "low" => Ok(Trigger::Low),
+        other => Err(CompileError::InvalidTrigger { circuit: circuit.name.clone(), id: comp.id.clone(), value: other.to_string() }),
+    }
+}
+
 /// Compiles every circuit in `project` into a `CircuitTemplate` library,
 /// keyed by circuit name — ready for `netlist::flatten(&project.main_circuit, ..)`.
 pub fn compile(project: &ProjectFile) -> Result<HashMap<String, CircuitTemplate>, CompileError> {
@@ -310,6 +359,16 @@ fn compile_circuit(
                     (TemplateNode::OutputPin { bits }, sink_geometry())
                 }
                 "core:PullResistor" => (TemplateNode::PullResistor(pull_target(circuit, comp)?), source_geometry()),
+                "core:Clock" => {
+                    let high = clock_duration_attr(circuit, comp, "highDuration")?;
+                    let low = clock_duration_attr(circuit, comp, "lowDuration")?;
+                    (TemplateNode::Clock { high, low }, source_geometry())
+                }
+                "core:Register" => {
+                    let bits = width_attr(circuit, comp)?;
+                    let trigger = trigger_attr(circuit, comp)?;
+                    (TemplateNode::Register { bits, trigger }, register_geometry())
+                }
                 other => {
                     return Err(CompileError::UnknownComponentType {
                         circuit: circuit.name.clone(),
@@ -752,5 +811,92 @@ mod tests {
         let mut sim = Simulation::new(netlist);
         sim.run_to_quiescence();
         assert_eq!(get_bits(&sim, 2), vec![Bit::One, Bit::Zero, Bit::One]); // 0b101 LSB-first
+    }
+
+    #[test]
+    fn rejects_zero_duration_clock() {
+        let mut attrs = BTreeMap::new();
+        attrs.insert("highDuration".to_string(), json!(0));
+        let project = single_circuit_project(Circuit {
+            name: "main".to_string(),
+            components: vec![ComponentInstance { attrs, ..comp("clk", "core:Clock", 0, 0) }],
+            wires: vec![],
+            annotations: vec![],
+        });
+        assert_eq!(
+            compile(&project).unwrap_err(),
+            CompileError::InvalidClockDuration {
+                circuit: "main".to_string(),
+                id: "clk".to_string(),
+                field: "highDuration",
+                value: 0,
+            }
+        );
+    }
+
+    #[test]
+    fn rejects_unknown_trigger_option() {
+        let mut attrs = BTreeMap::new();
+        attrs.insert("trigger".to_string(), json!("on_edge"));
+        let project = single_circuit_project(Circuit {
+            name: "main".to_string(),
+            components: vec![ComponentInstance { attrs, ..comp("r", "core:Register", 0, 0) }],
+            wires: vec![],
+            annotations: vec![],
+        });
+        assert_eq!(
+            compile(&project).unwrap_err(),
+            CompileError::InvalidTrigger { circuit: "main".to_string(), id: "r".to_string(), value: "on_edge".to_string() }
+        );
+    }
+
+    /// A `Clock` driving a `Register`'s CK end to end through compile ->
+    /// flatten -> `Simulation::tick()` -> settle — the actual point of
+    /// "one shared tick counter" (PLAN.md §14): `sim.tick()` is called on
+    /// the `Simulation`, never on the clock gate directly, and the
+    /// register still sees the right rising edges through it.
+    ///
+    /// Layout (see `register_geometry`/`source_geometry` offsets):
+    /// register "r" at (10,0) -> D=(10,0), CK=(11,2), CLR=(12,2), EN=(13,2),
+    /// Q=(14,0). `d` (Constant, coincides with D), `clk` (Clock, coincides
+    /// with CK) placed to land exactly on those points; CLR/EN left
+    /// floating on purpose (Unknown — exercises the same "undriven EN
+    /// still enables" default as the unit test, now through the compiler).
+    #[test]
+    fn clock_drives_a_register_through_simulation_tick() {
+        let mut const_attrs = BTreeMap::new();
+        const_attrs.insert("width".to_string(), json!(3));
+        const_attrs.insert("value".to_string(), json!(0b101));
+        let mut reg_attrs = BTreeMap::new();
+        reg_attrs.insert("width".to_string(), json!(3));
+
+        let project = single_circuit_project(Circuit {
+            name: "main".to_string(),
+            components: vec![
+                ComponentInstance { attrs: const_attrs, ..comp("d", "core:Constant", 10, 0) },
+                ComponentInstance { attrs: reg_attrs, ..comp("r", "core:Register", 10, 0) },
+                comp("clk", "core:Clock", 11, 2), // default high=low=1 -> period 2
+                ComponentInstance {
+                    attrs: { let mut a = BTreeMap::new(); a.insert("width".to_string(), json!(3)); a },
+                    ..comp("out", "core:OutputPin", 14, 0)
+                },
+            ],
+            wires: vec![],
+            annotations: vec![],
+        });
+
+        let library = compile(&project).unwrap();
+        let netlist = flatten(&project.main_circuit, &library).unwrap();
+        let mut sim = Simulation::new(netlist);
+        sim.run_to_quiescence();
+        assert_eq!(get_bits(&sim, 3), vec![Bit::Zero, Bit::Zero, Bit::Zero], "nothing latched before the first tick");
+
+        sim.tick(); // global tick 1: 1%2=1, not < low(1) -> high phase -> clock rises 0->1
+        sim.run_to_quiescence();
+        assert_eq!(get_bits(&sim, 3), vec![Bit::One, Bit::Zero, Bit::One], "rising edge latches D=0b101");
+
+        sim.tick(); // global tick 2: 2%2=0 < 1 -> low phase -> clock falls 1->0
+        sim.run_to_quiescence();
+        assert_eq!(get_bits(&sim, 3), vec![Bit::One, Bit::Zero, Bit::One], "falling edge must not relatch");
     }
 }

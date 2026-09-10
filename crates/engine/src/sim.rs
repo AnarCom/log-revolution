@@ -43,6 +43,17 @@ pub struct Simulation {
     outputs: Vec<Vec<Signal>>,
     time: Time,
     queue: BinaryHeap<Event>,
+    /// The *one* shared clock-tick counter for the whole simulation
+    /// (`Propagator.ticks` in `logisim-port`) — every `Gate::Clock`
+    /// instance reads this same counter, not its own timer; see the
+    /// `Gate::Clock` doc comment. Distinct from `time`: `time` is
+    /// propagation-delay units within a single settle, `global_ticks` only
+    /// advances on an explicit `tick()` call.
+    global_ticks: u64,
+    /// Precomputed once so `tick()` doesn't have to scan `netlist.gates`
+    /// (which can include the same subcircuit's clocks duplicated once per
+    /// instance, same as real Logisim walking every `CircuitState`).
+    clock_gates: Vec<usize>,
 }
 
 impl Simulation {
@@ -54,21 +65,71 @@ impl Simulation {
             .iter()
             .map(|g| vec![vec![Bit::Unknown]; g.output_count()])
             .collect();
+        let clock_gates = netlist
+            .gates
+            .iter()
+            .enumerate()
+            .filter(|(_, g)| matches!(g, crate::components::Gate::Clock { .. }))
+            .map(|(idx, _)| idx)
+            .collect();
+        let priming_depth = priming_depths(&netlist);
         let mut sim = Simulation {
             netlist,
             outputs,
             time: 0,
             queue: BinaryHeap::new(),
+            global_ticks: 0,
+            clock_gates,
         };
-        // Prime every gate once so sources (InputPin) and constants settle
-        // before anything reads them.
+        // Prime every gate once so sources (InputPin, Constant, Clock, ...)
+        // and everything downstream settles before anything reads it — but
+        // staggered by dependency depth (`priming_depth`), not all at the
+        // same instant `t=0`. A stateless/combinational gate would self-
+        // correct either way (a stale first read just gets superseded by a
+        // later, correct one, same as any ordinary propagation ripple —
+        // `run_to_quiescence` doesn't stop until the queue is empty). A
+        // *stateful* gate doesn't get that do-over: `Register`'s
+        // `last_clock` is written unconditionally on every `eval`, so if
+        // its first-ever read of `ck` landed on a not-yet-committed
+        // placeholder (`Unknown`, because the real upstream `Clock` hadn't
+        // had its own turn yet in the same simultaneous batch) that
+        // `Unknown` permanently overwrites the true initial history —
+        // there is no later batch that goes back and fixes it, because
+        // nothing re-derives history from scratch the way combinational
+        // `eval` re-derives outputs from current inputs. Staggering by
+        // depth guarantees every gate's *first* eval only ever reads
+        // already-committed (real, not placeholder) values from whatever
+        // feeds it directly.
         for idx in 0..sim.netlist.gates.len() {
-            sim.queue.push(Event { time: 0, gate: idx });
+            sim.queue.push(Event { time: priming_depth[idx], gate: idx });
         }
         sim
     }
 
     pub fn time(&self) -> Time {
+        self.time
+    }
+
+    pub fn global_ticks(&self) -> u64 {
+        self.global_ticks
+    }
+
+    /// Advances the shared clock counter by one and updates every
+    /// `Gate::Clock` in the design (mirrors `Simulator.doTick`'s
+    /// `propagator.tick()` — a single counter increment, applied to every
+    /// clock in the whole hierarchy at once, not per-instance timers).
+    /// Only marks the changed ones dirty; propagating that change through
+    /// the rest of the circuit is `step()`/`run_to_quiescence()`'s job, same
+    /// as any other external stimulus (`invoke`) — real Logisim's `tick()`
+    /// likewise only invalidates, a separate `propagate()` loop settles.
+    pub fn tick(&mut self) -> Time {
+        self.global_ticks += 1;
+        let t = self.global_ticks;
+        for idx in self.clock_gates.clone() {
+            if self.netlist.gates[idx].tick(t) {
+                self.queue.push(Event { time: self.time, gate: idx });
+            }
+        }
         self.time
     }
 
@@ -204,6 +265,63 @@ impl Simulation {
     pub fn output_of(&self, pin: PinRef) -> Signal {
         self.outputs[pin.0][pin.1].clone()
     }
+}
+
+/// Each gate's distance (in hops) from the nearest gate with no real
+/// drivers on any input pin — i.e. a source, or something floating enough
+/// to be treated as one. Used only to stagger `Simulation::new`'s initial
+/// priming events (see its doc comment for why staggering matters, not
+/// just simultaneous `t=0` for everyone).
+///
+/// A fixed-point relaxation, not a single topological pass, because
+/// Logisim circuits can genuinely contain feedback loops (cross-coupled
+/// gates, oscillators) where no acyclic topological order exists at all —
+/// gates that never resolve through the relaxation (because they're part
+/// of, or depend only on, such a cycle) fall back to depth `0`, the same
+/// treatment as an actual source. That's a reasonable fallback, not a
+/// hack: a cycle has no well-defined "settled initial value" to begin
+/// with, so there's nothing a smarter depth assignment could preserve for
+/// it anyway — same as today, it settles (or is detected oscillating)
+/// through ordinary re-triggering once the simulation actually starts
+/// stepping.
+fn priming_depths(netlist: &Netlist) -> Vec<Time> {
+    let n = netlist.gates.len();
+    let direct_sources: Vec<Vec<usize>> =
+        netlist.input_sources.iter().map(|pins| pins.iter().flatten().map(|&(g, _)| g).collect()).collect();
+
+    let mut depth: Vec<Option<Time>> = vec![None; n];
+    loop {
+        let mut progressed = false;
+        for i in 0..n {
+            if depth[i].is_some() {
+                continue;
+            }
+            if direct_sources[i].is_empty() {
+                depth[i] = Some(0);
+                progressed = true;
+                continue;
+            }
+            let mut max_dep = 0;
+            let mut all_resolved = true;
+            for &s in &direct_sources[i] {
+                match depth[s] {
+                    Some(d) => max_dep = max_dep.max(d),
+                    None => {
+                        all_resolved = false;
+                        break;
+                    }
+                }
+            }
+            if all_resolved {
+                depth[i] = Some(max_dep + 1);
+                progressed = true;
+            }
+        }
+        if !progressed {
+            break;
+        }
+    }
+    depth.into_iter().map(|d| d.unwrap_or(0)).collect()
 }
 
 #[cfg(test)]
@@ -495,5 +613,51 @@ mod tests {
             Bit::Error,
             "a real conflict stays an error, the pull resistor doesn't paper over it"
         );
+    }
+
+    /// Regression test for a real bug: staggering `Simulation::new`'s
+    /// initial priming by dependency depth (`priming_depths`) instead of
+    /// scheduling every gate at the same instant `t=0`. Before that fix,
+    /// this exact sequence — `tick()` called *before* any settle has ever
+    /// happened, which is exactly what a `.ctest` script does when its
+    /// first line is `simulate` (no leading bare settle) — corrupted
+    /// `Register`'s `last_clock` with a stale `Unknown` placeholder read
+    /// of `Clock`'s not-yet-committed output, permanently hiding the real
+    /// rising edge. `clock_drives_a_register_through_simulation_tick` in
+    /// `compile.rs` didn't catch this because it happened to call
+    /// `run_to_quiescence()` once *before* the first `tick()`, which
+    /// incidentally let the corruption self-heal (`Unknown` -> `Zero`,
+    /// coincidentally the value it needed to be) before the real edge
+    /// occurred — this test deliberately uses the *other* (more common,
+    /// via `.ctest`) call order, where that lucky self-heal can't happen.
+    fn clock_feeds_register_circuit() -> CircuitTemplate {
+        CircuitTemplate {
+            name: "main".to_string(),
+            nodes: vec![
+                TemplateNode::Constant { bits: 1, value: 1 }, // 0: D, fixed at 1
+                TemplateNode::Clock { high: 1, low: 1 },      // 1: CK, period 2
+                TemplateNode::Register { bits: 1, trigger: crate::components::Trigger::Rising }, // 2
+                TemplateNode::OutputPin { bits: 1 },          // 3: Q
+            ],
+            connections: vec![((0, 0), (2, 0)), ((1, 0), (2, 1)), ((2, 0), (3, 0))],
+            input_ports: Vec::new(),
+            output_ports: Vec::new(),
+            port_marker_nodes: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn register_sees_the_first_real_clock_edge_even_without_a_leading_settle() {
+        let mut library = HashMap::new();
+        library.insert("main".to_string(), clock_feeds_register_circuit());
+        let netlist = flatten("main", &library).unwrap();
+        let mut sim = Simulation::new(netlist);
+
+        // No `run_to_quiescence()` here on purpose — `tick()` is the very
+        // first thing called, exactly like a `.ctest` script whose first
+        // statement is `simulate`.
+        sim.tick(); // global tick 1: high=low=1 -> period 2, 1%2=1 -> high phase -> clock rises 0->1
+        sim.run_to_quiescence();
+        assert_eq!(get_bit(&sim, 3), Bit::One, "the rising edge must be observed, not swallowed by a stale priming read");
     }
 }

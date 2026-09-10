@@ -20,7 +20,7 @@
 //! usable whether or not the circuit they're in is ever used as a
 //! subcircuit.
 
-use crate::components::Gate;
+use crate::components::{Gate, Trigger};
 use plugin_abi::Bit;
 use std::collections::HashMap;
 
@@ -43,6 +43,11 @@ pub enum TemplateNode {
     /// it — see `Gate::PullResistor` for why it's wired in like a normal
     /// driver but resolved specially.
     PullResistor(Bit),
+    /// See `Gate::Clock`'s doc comment: `high`/`low` are the period
+    /// attributes, not an independent timer — actual advancement happens
+    /// only through `Simulation::tick`.
+    Clock { high: u64, low: u64 },
+    Register { bits: u8, trigger: Trigger },
     /// Reference to another `CircuitTemplate` by name, resolved during
     /// `flatten`. As a connection endpoint, its pins are numbered
     /// `0..input_ports.len()` for inputs then `input_ports.len()..` for
@@ -220,6 +225,18 @@ fn expand(
             }
             TemplateNode::PullResistor(to) => {
                 local_to_global.insert(local_idx, builder.add_gate(Gate::PullResistor { to: *to }));
+            }
+            TemplateNode::Clock { high, low } => {
+                local_to_global.insert(
+                    local_idx,
+                    builder.add_gate(Gate::Clock { high: *high, low: *low, clicks: 0, sending: Bit::Zero }),
+                );
+            }
+            TemplateNode::Register { bits, trigger } => {
+                local_to_global.insert(
+                    local_idx,
+                    builder.add_gate(Gate::Register { bits: *bits, trigger: *trigger, value: 0, last_clock: Bit::Zero }),
+                );
             }
             TemplateNode::Subcircuit(sub_name) => {
                 let (ports, _) = expand(sub_name, library, builder, stack, false)?;

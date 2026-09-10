@@ -68,6 +68,55 @@ pub enum Gate {
     /// inference we don't have yet (deferred, PLAN.md §14) — a pull
     /// resistor on a wide bus should be modeled per-bit externally for now.
     PullResistor { to: Bit },
+    /// A square-wave source — but *not* its own independent timer. Real
+    /// Logisim has exactly one global tick counter for the whole
+    /// simulation (`Propagator.ticks`); every `Clock` instance is a pure
+    /// function of that shared counter and its own `high`/`low` period
+    /// (`Clock.tick`, verified in `logisim-port`) — not a thing that runs
+    /// on its own clock. `eval` here never recomputes `sending` itself
+    /// (mirrors `Clock.propagate`, which just re-emits the cached value);
+    /// only `Gate::tick` — driven once per `Simulation::tick()` call, for
+    /// every clock in the design at once — advances it. `clicks` mirrors
+    /// `ClockState.clicks`: a manual Poke-toggle (`invoke("toggle", ...)`)
+    /// flips `sending` immediately *and* permanently shifts the phase
+    /// parity for every later tick.
+    Clock { high: u64, low: u64, clicks: u64, sending: Bit },
+    /// Edge/level-triggered storage (`std/memory/Register.java`): latches
+    /// `d` into `value` when `trigger` fires on `ck` and `en` isn't
+    /// exactly `Zero` (note: *not* "exactly `One`" — an undriven/`Unknown`
+    /// enable still latches, matching `state.getPort(EN) != Value.FALSE`
+    /// verbatim, not the "safer-looking" reading), unless `clr` is `One`
+    /// (asynchronous clear, wins outright, doesn't need a clock edge). A
+    /// `d` that isn't fully defined (any `Unknown`/`Error` bit) is ignored
+    /// wholesale that cycle — `value` holds its previous contents, it
+    /// never latches a partially-known word (`in.isFullyDefined()`).
+    /// Output is always fully defined (`value` is a plain integer, never
+    /// `Unknown`/`Error` itself).
+    Register { bits: u8, trigger: Trigger, value: u32, last_clock: Bit },
+}
+
+/// `StdAttr.TRIGGER`'s four options, sames names as the JSON attribute
+/// values (`"rising"`/`"falling"`/`"high"`/`"low"`) — see `compile.rs`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Trigger {
+    Rising,
+    Falling,
+    High,
+    Low,
+}
+
+impl Trigger {
+    /// Mirrors `ClockState.updateClock`: `old`/`new` must be *exactly*
+    /// `Zero`/`One` for an edge to count — an `Unknown`/`Error` clock input
+    /// never counts as "was low" or "is high".
+    fn fired(self, old: Bit, new: Bit) -> bool {
+        match self {
+            Trigger::Rising => old == Bit::Zero && new == Bit::One,
+            Trigger::Falling => old == Bit::One && new == Bit::Zero,
+            Trigger::High => new == Bit::One,
+            Trigger::Low => new == Bit::Zero,
+        }
+    }
 }
 
 /// One input pin's bit `i`, or `Unknown` if that pin is unconnected/narrower
@@ -128,11 +177,36 @@ fn zeros(bits: u8) -> Signal {
     vec![Bit::Zero; bits as usize]
 }
 
+/// Little-endian (bit 0 = LSB, same convention as `ctest::bits_to_u64` and
+/// `InputPin`'s own `"set"` action) — `None` if any bit isn't exactly
+/// `Zero`/`One`, mirroring `Value.isFullyDefined`/`toIntValue`'s pairing in
+/// `Register.propagate`: a not-fully-defined `d` is ignored outright, not
+/// partially latched.
+fn signal_to_u32_if_defined(signal: &Signal, bits: u8) -> Option<u32> {
+    let mut value = 0u32;
+    for i in 0..bits as usize {
+        match bit_at(signal, i) {
+            Bit::One => value |= 1 << i,
+            Bit::Zero => {}
+            Bit::Unknown | Bit::Error => return None,
+        }
+    }
+    Some(value)
+}
+
+fn u32_to_signal(value: u32, bits: u8) -> Signal {
+    (0..bits as usize).map(|i| if (value >> i) & 1 != 0 { Bit::One } else { Bit::Zero }).collect()
+}
+
 impl Gate {
     /// Propagation delay in ticks. Only things that can be *downstream* of
     /// another gate in the same instant need a nonzero delay — see
     /// PLAN.md §3's parallel-batch note in `crates/engine/src/sim.rs` for
-    /// why that matters, not just for realism.
+    /// why that matters, not just for realism. `Register`'s `8` (not `1`)
+    /// mirrors `Register.DELAY` verbatim — real Logisim gives it a longer
+    /// settle than a plain gate; harmless here either way since the
+    /// parallel-batch invariant only needs delay `>= 1`, not any specific
+    /// value.
     pub fn delay(&self) -> u64 {
         match self {
             Gate::And { .. }
@@ -143,7 +217,37 @@ impl Gate {
             | Gate::Xor { .. }
             | Gate::Xnor { .. }
             | Gate::Buffer { .. } => 1,
-            Gate::InputPin { .. } | Gate::OutputPin { .. } | Gate::PullResistor { .. } | Gate::Constant { .. } => 0,
+            Gate::Register { .. } => 8,
+            Gate::InputPin { .. }
+            | Gate::OutputPin { .. }
+            | Gate::PullResistor { .. }
+            | Gate::Constant { .. }
+            | Gate::Clock { .. } => 0,
+        }
+    }
+
+    /// Advances a `Clock`'s cached output to reflect the *shared* tick
+    /// counter (see the `Gate::Clock` doc comment) — a no-op, returning
+    /// `false`, for every other gate kind. Returns whether the cached
+    /// value actually changed, so `Simulation::tick` only needs to
+    /// reschedule the clocks that did (though rescheduling unconditionally
+    /// would also be harmless — `step()` already no-ops on an unchanged
+    /// output).
+    pub fn tick(&mut self, global_tick: u64) -> bool {
+        let Gate::Clock { high, low, clicks, sending } = self else {
+            return false;
+        };
+        let period = *high + *low;
+        let mut in_low_phase = global_tick % period < *low;
+        if *clicks % 2 == 1 {
+            in_low_phase = !in_low_phase;
+        }
+        let desired = if in_low_phase { Bit::Zero } else { Bit::One };
+        if *sending == desired {
+            false
+        } else {
+            *sending = desired;
+            true
         }
     }
 }
@@ -152,6 +256,14 @@ impl Component for Gate {
     fn init(&mut self) {
         match self {
             Gate::InputPin { bits, value } | Gate::OutputPin { bits, value } => *value = zeros(*bits),
+            Gate::Clock { clicks, sending, .. } => {
+                *clicks = 0;
+                *sending = Bit::Zero; // matches `ClockState.sending`'s initial `Value.FALSE`
+            }
+            Gate::Register { value, last_clock, .. } => {
+                *value = 0;
+                *last_clock = Bit::Zero; // matches memory `ClockState`'s initial `Value.FALSE`
+            }
             // Not runtime state to reset — fixed at instantiation (an
             // attribute in Logisim terms, not simulated state).
             Gate::And { .. }
@@ -176,9 +288,12 @@ impl Component for Gate {
             | Gate::Xor { inputs, .. }
             | Gate::Xnor { inputs, .. } => *inputs,
             Gate::Not { .. } | Gate::Buffer { .. } | Gate::OutputPin { .. } => 1,
+            // d, ck, clr, en — this fixed order is what `compile.rs`'s
+            // register geometry and `eval` below both key off of.
+            Gate::Register { .. } => 4,
             // Real Logisim's `propagate` is a no-op for these too — none of
             // them ever react to anything, they're all sources.
-            Gate::InputPin { .. } | Gate::PullResistor { .. } | Gate::Constant { .. } => 0,
+            Gate::InputPin { .. } | Gate::PullResistor { .. } | Gate::Constant { .. } | Gate::Clock { .. } => 0,
         }
     }
 
@@ -199,21 +314,52 @@ impl Component for Gate {
             Gate::Xor { bits, .. } => vec![fold_xor_one(inputs, *bits)],
             Gate::Xnor { bits, .. } => vec![not_bits(fold_xor_one(inputs, *bits))],
             Gate::Buffer { bits } => vec![(0..*bits as usize).map(|i| bit_at(&inputs[0], i)).collect()],
-            Gate::Constant { bits, value } => {
-                vec![(0..*bits as usize).map(|i| if (*value >> i) & 1 != 0 { Bit::One } else { Bit::Zero }).collect()]
-            }
+            Gate::Constant { bits, value } => vec![u32_to_signal(*value, *bits)],
             Gate::InputPin { value, .. } => vec![value.clone()],
             Gate::OutputPin { bits, value } => {
                 *value = (0..*bits as usize).map(|i| bit_at(&inputs[0], i)).collect();
                 Vec::new()
             }
             Gate::PullResistor { to } => vec![vec![*to]],
+            // Never recomputed from `inputs` — only `Gate::tick` (driven by
+            // the shared tick counter) changes `sending`; `eval` just
+            // re-emits the cached value, mirroring `Clock.propagate`.
+            Gate::Clock { sending, .. } => vec![vec![*sending]],
+            Gate::Register { bits, trigger, value, last_clock } => {
+                let d = &inputs[0];
+                let ck = bit_at(&inputs[1], 0);
+                let clr = bit_at(&inputs[2], 0);
+                let en = bit_at(&inputs[3], 0);
+
+                let triggered = trigger.fired(*last_clock, ck);
+                *last_clock = ck;
+
+                if clr == Bit::One {
+                    *value = 0;
+                } else if triggered && en != Bit::Zero {
+                    if let Some(v) = signal_to_u32_if_defined(d, *bits) {
+                        *value = v;
+                    }
+                }
+
+                vec![u32_to_signal(*value, *bits)]
+            }
         }
     }
 
     fn serialize_state(&self) -> Vec<u8> {
         match self {
             Gate::InputPin { value, .. } | Gate::OutputPin { value, .. } => value.iter().copied().map(bit_to_byte).collect(),
+            Gate::Clock { clicks, sending, .. } => {
+                let mut out = clicks.to_le_bytes().to_vec();
+                out.push(bit_to_byte(*sending));
+                out
+            }
+            Gate::Register { value, last_clock, .. } => {
+                let mut out = value.to_le_bytes().to_vec();
+                out.push(bit_to_byte(*last_clock));
+                out
+            }
             // Configuration, not runtime state — nothing to persist.
             Gate::And { .. }
             | Gate::Or { .. }
@@ -229,8 +375,28 @@ impl Component for Gate {
     }
 
     fn deserialize_state(&mut self, state: &[u8]) {
-        if let Gate::InputPin { bits, value } | Gate::OutputPin { bits, value } = self {
-            *value = (0..*bits as usize).map(|i| state.get(i).copied().map(byte_to_bit).unwrap_or(Bit::Zero)).collect();
+        match self {
+            Gate::InputPin { bits, value } | Gate::OutputPin { bits, value } => {
+                *value = (0..*bits as usize).map(|i| state.get(i).copied().map(byte_to_bit).unwrap_or(Bit::Zero)).collect();
+            }
+            Gate::Clock { clicks, sending, .. } => {
+                *clicks = state.get(0..8).and_then(|b| b.try_into().ok()).map(u64::from_le_bytes).unwrap_or(0);
+                *sending = state.get(8).copied().map(byte_to_bit).unwrap_or(Bit::Zero);
+            }
+            Gate::Register { value, last_clock, .. } => {
+                *value = state.get(0..4).and_then(|b| b.try_into().ok()).map(u32::from_le_bytes).unwrap_or(0);
+                *last_clock = state.get(4).copied().map(byte_to_bit).unwrap_or(Bit::Zero);
+            }
+            Gate::And { .. }
+            | Gate::Or { .. }
+            | Gate::Not { .. }
+            | Gate::Nand { .. }
+            | Gate::Nor { .. }
+            | Gate::Xor { .. }
+            | Gate::Xnor { .. }
+            | Gate::Buffer { .. }
+            | Gate::Constant { .. }
+            | Gate::PullResistor { .. } => {}
         }
     }
 
@@ -238,51 +404,78 @@ impl Component for Gate {
         match self {
             Gate::InputPin { bits, .. } if *bits == 1 => vec!["set", "on", "off", "toggle"],
             Gate::InputPin { .. } => vec!["set"],
+            // Manual Poke-toggle (`ClockPoker`) — pulses the clock once,
+            // independent of `Simulation::tick`, and permanently shifts its
+            // phase parity (see `Gate::Clock`'s doc comment).
+            Gate::Clock { .. } => vec!["toggle"],
+            // Poke-tool-style direct write, bypassing the clock/enable
+            // logic entirely — useful for `.ctest` to seed a register's
+            // initial contents without stepping a clock edge.
+            Gate::Register { .. } => vec!["set"],
             _ => Vec::new(),
         }
     }
 
     fn invoke(&mut self, name: &str, arg: Option<Value>) -> Result<(), ActionError> {
-        let Gate::InputPin { bits, value } = self else {
-            return Err(ActionError::UnknownAction(name.to_string()));
-        };
-        match (name, arg) {
-            ("on", _) if *bits == 1 => {
-                *value = vec![Bit::One];
+        match self {
+            Gate::InputPin { bits, value } => match (name, arg) {
+                ("on", _) if *bits == 1 => {
+                    *value = vec![Bit::One];
+                    Ok(())
+                }
+                ("off", _) if *bits == 1 => {
+                    *value = vec![Bit::Zero];
+                    Ok(())
+                }
+                ("toggle", _) if *bits == 1 => {
+                    *value = vec![if value[0] == Bit::One { Bit::Zero } else { Bit::One }];
+                    Ok(())
+                }
+                ("set", Some(Value::Bool(b))) if *bits == 1 => {
+                    *value = vec![if b { Bit::One } else { Bit::Zero }];
+                    Ok(())
+                }
+                // Little-endian, same convention as `ctest::bits_to_u64`.
+                ("set", Some(Value::Int(i))) => {
+                    *value = (0..*bits as usize).map(|k| if (i >> k) & 1 != 0 { Bit::One } else { Bit::Zero }).collect();
+                    Ok(())
+                }
+                ("set", Some(Value::Bits(bs))) if bs.len() == *bits as usize => {
+                    *value = bs;
+                    Ok(())
+                }
+                ("set", arg) => Err(ActionError::InvalidArg {
+                    action: "set".to_string(),
+                    reason: format!("expected Bool (1-bit only), Int, or {bits}-bit Bits, got {arg:?}"),
+                }),
+                (other, _) => Err(ActionError::UnknownAction(other.to_string())),
+            },
+            // `ClockPoker.mouseReleased`, verbatim: flip `sending` *and*
+            // bump `clicks` together — the parity shift is what keeps
+            // future `tick()` calls consistent with this manual flip.
+            Gate::Clock { clicks, sending, .. } if name == "toggle" => {
+                *sending = sending.not();
+                *clicks += 1;
                 Ok(())
             }
-            ("off", _) if *bits == 1 => {
-                *value = vec![Bit::Zero];
-                Ok(())
-            }
-            ("toggle", _) if *bits == 1 => {
-                *value = vec![if value[0] == Bit::One { Bit::Zero } else { Bit::One }];
-                Ok(())
-            }
-            ("set", Some(Value::Bool(b))) if *bits == 1 => {
-                *value = vec![if b { Bit::One } else { Bit::Zero }];
-                Ok(())
-            }
-            // Little-endian, same convention as `ctest::bits_to_u64`.
-            ("set", Some(Value::Int(i))) => {
-                *value = (0..*bits as usize).map(|k| if (i >> k) & 1 != 0 { Bit::One } else { Bit::Zero }).collect();
-                Ok(())
-            }
-            ("set", Some(Value::Bits(bs))) if bs.len() == *bits as usize => {
-                *value = bs;
-                Ok(())
-            }
-            ("set", arg) => Err(ActionError::InvalidArg {
-                action: "set".to_string(),
-                reason: format!("expected Bool (1-bit only), Int, or {bits}-bit Bits, got {arg:?}"),
-            }),
-            (other, _) => Err(ActionError::UnknownAction(other.to_string())),
+            Gate::Register { bits, value, .. } => match (name, arg) {
+                ("set", Some(Value::Int(i))) => {
+                    *value = (i as u64 & (u64::MAX >> (64 - *bits as u32))) as u32;
+                    Ok(())
+                }
+                ("set", arg) => Err(ActionError::InvalidArg {
+                    action: "set".to_string(),
+                    reason: format!("expected Int, got {arg:?}"),
+                }),
+                (other, _) => Err(ActionError::UnknownAction(other.to_string())),
+            },
+            _ => Err(ActionError::UnknownAction(name.to_string())),
         }
     }
 
     fn readouts(&self) -> Vec<&'static str> {
         match self {
-            Gate::InputPin { .. } | Gate::OutputPin { .. } => vec!["get"],
+            Gate::InputPin { .. } | Gate::OutputPin { .. } | Gate::Clock { .. } | Gate::Register { .. } => vec!["get"],
             _ => Vec::new(),
         }
     }
@@ -293,6 +486,8 @@ impl Component for Gate {
             // Unknown/Error, which a `.ctest` assertion should be able to
             // see (PLAN.md §7).
             (Gate::InputPin { value, .. } | Gate::OutputPin { value, .. }, "get") => Ok(Value::Bits(value.clone())),
+            (Gate::Clock { sending, .. }, "get") => Ok(Value::Bits(vec![*sending])),
+            (Gate::Register { bits, value, .. }, "get") => Ok(Value::Bits(u32_to_signal(*value, *bits))),
             (_, other) => Err(ReadoutError::UnknownReadout(other.to_string())),
         }
     }
@@ -430,5 +625,121 @@ mod tests {
         assert_eq!(pin.invoke("on", None), Err(ActionError::UnknownAction("on".to_string())));
         pin.invoke("set", Some(Value::Int(0b1010))).unwrap();
         assert_eq!(pin.read("get"), Ok(Value::Bits(vec![Bit::Zero, Bit::One, Bit::Zero, Bit::One])));
+    }
+
+    fn clock(high: u64, low: u64) -> Gate {
+        Gate::Clock { high, low, clicks: 0, sending: Bit::Zero }
+    }
+
+    #[test]
+    fn clock_is_a_pure_function_of_the_shared_tick_counter_not_its_own_timer() {
+        // high=2, low=1: period 3, low-phase is ticks%3 < 1 i.e. tick%3==0.
+        let mut c = clock(2, 1);
+        // eval never recomputes anything on its own — starts at the
+        // `init`/construction default (Zero) until `tick` is called.
+        assert_eq!(c.eval(&[]), vec![vec![Bit::Zero]]);
+
+        let expected = [
+            (1u64, Bit::One),  // 1%3=1 -> high phase
+            (2, Bit::One),     // 2%3=2 -> high phase
+            (3, Bit::Zero),    // 3%3=0 -> low phase
+            (4, Bit::One),
+        ];
+        for (t, want) in expected {
+            c.tick(t);
+            assert_eq!(c.eval(&[])[0][0], want, "tick {t}");
+        }
+    }
+
+    #[test]
+    fn clock_tick_reports_whether_the_cached_value_actually_changed() {
+        let mut c = clock(1, 1); // period 2: alternates every tick
+        assert!(c.tick(1)); // 1%2=1 -> not < 1 -> high phase -> One, changed from Zero
+        assert!(!c.tick(1), "calling tick again with the same tick number is idempotent");
+    }
+
+    #[test]
+    fn clock_manual_toggle_flips_immediately_and_shifts_future_phase() {
+        let mut c = clock(1, 1);
+        c.invoke("toggle", None).unwrap();
+        assert_eq!(c.read("get"), Ok(Value::Bits(vec![Bit::One])), "toggle flips immediately, no tick needed");
+
+        // Without the toggle, tick(2) would be low phase (2%2=0 < 1) -> Zero.
+        // The manual flip's odd `clicks` inverts every future phase decision.
+        c.tick(2);
+        assert_eq!(c.read("get"), Ok(Value::Bits(vec![Bit::One])), "parity shifted by the manual click");
+    }
+
+    fn register(bits: u8, trigger: Trigger) -> Gate {
+        Gate::Register { bits, trigger, value: 0, last_clock: Bit::Zero }
+    }
+
+    fn reg_inputs(d: &[Bit], ck: Bit, clr: Bit, en: Bit) -> Vec<Signal> {
+        vec![d.to_vec(), vec![ck], vec![clr], vec![en]]
+    }
+
+    #[test]
+    fn register_latches_on_rising_edge_when_enabled() {
+        let mut r = register(4, Trigger::Rising);
+        let d = [Bit::One, Bit::Zero, Bit::One, Bit::Zero]; // 0b0101 = 5, LSB-first
+
+        // Clock still low: no edge yet, output stays 0.
+        let out = r.eval(&reg_inputs(&d, Bit::Zero, Bit::Zero, Bit::One));
+        assert_eq!(out, vec![zeros(4)]);
+
+        // Rising edge with EN=1: latches.
+        let out = r.eval(&reg_inputs(&d, Bit::One, Bit::Zero, Bit::One));
+        assert_eq!(out, vec![d.to_vec()]);
+
+        // Staying high (no new edge) with a different D: does NOT relatch.
+        let d2 = [Bit::Zero, Bit::Zero, Bit::Zero, Bit::Zero];
+        let out = r.eval(&reg_inputs(&d2, Bit::One, Bit::Zero, Bit::One));
+        assert_eq!(out, vec![d.to_vec()], "no edge, value must hold");
+    }
+
+    #[test]
+    fn register_undriven_enable_still_latches_matching_value_ne_false() {
+        // `state.getPort(EN) != Value.FALSE` in Register.java: Unknown is
+        // "not exactly FALSE", so it still enables — a real, not obvious,
+        // Logisim behavior (floating EN defaults to "on").
+        let mut r = register(1, Trigger::Rising);
+        let out = r.eval(&reg_inputs(&[Bit::One], Bit::One, Bit::Zero, Bit::Unknown));
+        assert_eq!(out, vec![vec![Bit::One]], "Unknown EN still latches");
+    }
+
+    #[test]
+    fn register_explicit_false_enable_blocks_latching() {
+        let mut r = register(1, Trigger::Rising);
+        let out = r.eval(&reg_inputs(&[Bit::One], Bit::One, Bit::Zero, Bit::Zero));
+        assert_eq!(out, vec![vec![Bit::Zero]], "EN=0 blocks the edge");
+    }
+
+    #[test]
+    fn register_clear_wins_over_everything_without_needing_an_edge() {
+        let mut r = register(4, Trigger::Rising);
+        r.eval(&reg_inputs(&[Bit::One, Bit::One, Bit::One, Bit::One], Bit::One, Bit::Zero, Bit::One));
+        assert_eq!(r.eval(&reg_inputs(&zeros(4), Bit::One, Bit::Zero, Bit::One))[0], vec![Bit::One; 4]);
+
+        // CLR=1, clock still high (no new edge) — clear still wins.
+        let out = r.eval(&reg_inputs(&zeros(4), Bit::One, Bit::One, Bit::One));
+        assert_eq!(out, vec![zeros(4)]);
+    }
+
+    #[test]
+    fn register_ignores_a_partially_undefined_input_wholesale() {
+        let mut r = register(2, Trigger::Rising);
+        r.eval(&reg_inputs(&[Bit::One, Bit::One], Bit::One, Bit::Zero, Bit::One)); // latches 0b11
+        // Rising edge again, but D has an Unknown bit -> must not relatch,
+        // not even partially.
+        r.eval(&reg_inputs(&[Bit::One, Bit::Zero], Bit::Zero, Bit::Zero, Bit::One)); // drop clock first
+        let out = r.eval(&reg_inputs(&[Bit::One, Bit::Unknown], Bit::One, Bit::Zero, Bit::One));
+        assert_eq!(out, vec![vec![Bit::One, Bit::One]], "undefined D leaves the old value untouched");
+    }
+
+    #[test]
+    fn register_set_action_writes_directly_bypassing_clock_and_enable() {
+        let mut r = register(4, Trigger::Rising);
+        r.invoke("set", Some(Value::Int(0b1010))).unwrap();
+        assert_eq!(r.read("get"), Ok(Value::Bits(vec![Bit::Zero, Bit::One, Bit::Zero, Bit::One])));
     }
 }

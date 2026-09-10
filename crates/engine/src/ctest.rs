@@ -212,11 +212,15 @@ impl RunReport {
 }
 
 /// Runs a parsed script against `sim`, resolving `component[id]` through
-/// `resolve`. `simulate <n>` currently just calls `run_to_quiescence()` —
-/// there's no clocked component yet for "n ticks" to mean anything more
-/// specific than "settle, n times" (harmless once already quiescent); the
-/// open question of what `n` means with multiple independent clocks
-/// (PLAN.md §14) is unresolved and deliberately not guessed at here.
+/// `resolve`. `simulate <n>` means "n *global* clock ticks, each followed
+/// by a full settle" — `Simulation::tick` (see its doc comment) advances
+/// the one shared tick counter every `Gate::Clock` in the design reads
+/// from, exactly mirroring `logisim-port`'s own `Simulator`: `doTick()`
+/// then `propagate()` to quiescence, per tick. There's no "independent
+/// clocks" ambiguity to resolve (the old open question in PLAN.md §14) —
+/// real Logisim doesn't have independent clocks either, just one counter
+/// and per-instance period dividers, so `n` unambiguously means `n` ticks
+/// of that one counter.
 pub fn run(
     script: &[(usize, Statement)],
     sim: &mut Simulation,
@@ -228,6 +232,7 @@ pub fn run(
         match statement {
             Statement::Simulate { ticks } => {
                 for _ in 0..ticks.unwrap_or(1).max(1) {
+                    sim.tick();
                     sim.run_to_quiescence();
                 }
             }
