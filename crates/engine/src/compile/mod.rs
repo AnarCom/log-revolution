@@ -55,152 +55,37 @@
 //! `logisim-port`) rather than inventing our own — this is our own JSON
 //! schema, not `.circ`, but matching Logisim's names now means the `.circ`
 //! importer (PLAN.md §9) won't need a translation table for them later.
+//!
+//! `CompileError`/`Geometry`/`Dsu` moved out to their own `error`/
+//! `geometry`/`dsu` submodules purely for this file's size (pure code
+//! motion, not a behavior change) — everything that actually *is*
+//! `compile_circuit`'s own algorithm (the union-find walk, port
+//! resolution) stays here, since splitting an algorithm across files tends
+//! to make it harder to follow, not easier.
 
 mod arithmetic;
+mod dsu;
+mod error;
+mod geometry;
 mod logic;
 mod memory;
 mod plexers;
 mod splitter;
 mod wiring;
 
-use crate::file_format::{Circuit, ComponentInstance, Facing, ProjectFile};
+use crate::file_format::{Circuit, ComponentInstance, ProjectFile};
 use crate::netlist::{BitRef, CircuitTemplate, TemplateNode};
+use dsu::{Dsu, Lane, MAX_WIDTH};
+use geometry::{rotate, sink_geometry, source_geometry, subcircuit_geometry, unary_geometry, Geometry, Point};
 use std::collections::{HashMap, HashSet};
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum CompileError {
-    UnknownComponentType { circuit: String, id: String, type_: String },
-    UnknownSubcircuit { circuit: String, id: String, referenced: String },
-    InvalidPullTarget { circuit: String, id: String, value: String },
-    DuplicateComponentId { circuit: String, id: String },
-    /// `attrs["width"]` outside 1..=32 — `logisim-port`'s own ceiling
-    /// (`Value.MAX_WIDTH`; see `BitWidth.create`, which rejects <= 0, and
-    /// `Value.create`, which rejects > `MAX_WIDTH`). Rejected outright
-    /// rather than silently clamped, so a schema/import bug shows up at
-    /// compile time, not as a quietly-truncated bus.
-    InvalidWidth { circuit: String, id: String, value: i64 },
-    /// `attrs["inputs"]` outside 2..=32 — `GateAttributes.MAX_INPUTS`/
-    /// `ATTR_INPUTS`'s own range (a gate needs at least 2 inputs to mean
-    /// anything, and Logisim caps it at 32 same as bit width).
-    InvalidInputCount { circuit: String, id: String, value: i64 },
-    /// `attrs["highDuration"]`/`attrs["lowDuration"]` below 1 —
-    /// `Clock.ATTR_HIGH`/`ATTR_LOW`'s own `DurationAttribute` range (a
-    /// clock phase lasting zero ticks is meaningless).
-    InvalidClockDuration { circuit: String, id: String, field: &'static str, value: i64 },
-    /// `attrs["trigger"]` isn't one of `StdAttr.TRIGGER`'s own four option
-    /// strings (`"rising"`/`"falling"`/`"high"`/`"low"`).
-    InvalidTrigger { circuit: String, id: String, value: String },
-    /// `attrs["select"]` outside 1..=5 — `Plexers.ATTR_SELECT`'s own range
-    /// (`Attributes.forBitWidth("select", .., 1, 5)`).
-    InvalidSelectWidth { circuit: String, id: String, value: i64 },
-    /// `attrs["disabled"]` isn't one of `Plexers.ATTR_DISABLED`'s two
-    /// option strings (`"Z"`/`"0"`).
-    InvalidDisabledOption { circuit: String, id: String, value: String },
-    /// `attrs["mode"]` for `core:Comparator` isn't one of `Comparator.java`'s
-    /// own two option strings (`"twosComplement"`/`"unsigned"`).
-    InvalidComparatorMode { circuit: String, id: String, value: String },
-    /// `attrs["fanout"]` outside 1..=32 — `SplitterAttributes.ATTR_FANOUT`'s
-    /// own range (`Attributes.forIntegerRange("fanout", .., 1, 32)`).
-    InvalidFanout { circuit: String, id: String, value: i64 },
-    /// `attrs["bits"]` (this schema's own encoding of `bit_end`, see
-    /// `compile/splitter.rs`) has the wrong length or an out-of-range
-    /// entry.
-    InvalidSplitterBits { circuit: String, id: String, reason: String },
-    /// `attrs["type"]` for `core:BitExtender` isn't one of `BitExtender.
-    /// java`'s own four option strings (`"zero"`/`"one"`/`"sign"`/`"input"`).
-    InvalidExtendType { circuit: String, id: String, value: String },
-}
-
-type Point = (i32, i32);
-
-/// A component's pins, relative to its own origin, at `Facing::East`
-/// (rotated per-instance for other facings). Deliberately small/arbitrary
-/// — this is our own schema, not `.circ`'s exact pixel geometry; matching
-/// that is the importer's job (PLAN.md §9), not this compiler's.
-struct Geometry {
-    inputs: Vec<Point>,
-    outputs: Vec<Point>,
-}
-
-/// Single-input, single-output leaf shape (Not/Buffer): one input dead
-/// center, one output two units east.
-fn unary_geometry() -> Geometry {
-    Geometry { inputs: vec![(0, 0)], outputs: vec![(2, 0)] }
-}
-
-/// Source/sink leaf shape with no input side (InputPin/Constant/
-/// PullResistor/Clock — spans both `wiring` and `memory`, hence living
-/// here rather than in either): a single output pin at the origin.
-fn source_geometry() -> Geometry {
-    Geometry { inputs: vec![], outputs: vec![(0, 0)] }
-}
-
-/// `OutputPin`: the mirror of `source_geometry` — one input, no outputs.
-fn sink_geometry() -> Geometry {
-    Geometry { inputs: vec![(0, 0)], outputs: vec![] }
-}
-
-/// A subcircuit instance's port count varies per reference, so its
-/// footprint is computed rather than looked up: input ports stacked down
-/// the left edge, output ports down the right, on a fixed-width box.
-/// Arbitrary — nothing renders this yet, only connectivity matters.
-const SUBCIRCUIT_WIDTH: i32 = 6;
-
-fn subcircuit_geometry(input_ports: usize, output_ports: usize) -> Geometry {
-    Geometry {
-        inputs: (0..input_ports).map(|i| (0, 2 * i as i32)).collect(),
-        outputs: (0..output_ports).map(|i| (SUBCIRCUIT_WIDTH, 2 * i as i32)).collect(),
-    }
-}
-
-/// Rotates a `Facing::East`-relative offset for the other three facings.
-/// East is the identity; the rest are 90°-step rotations, applied
-/// consistently (not matched to any particular on-screen convention, since
-/// nothing renders this yet).
-fn rotate(offset: Point, facing: Facing) -> Point {
-    let (dx, dy) = offset;
-    match facing {
-        Facing::East => (dx, dy),
-        Facing::South => (-dy, dx),
-        Facing::West => (-dx, -dy),
-        Facing::North => (dy, -dx),
-    }
-}
-
-/// A single electrical *bit lane*: bit `1` of a point coinciding with a
-/// 4-bit pin is a different lane than bit `0` there, and a `Splitter` can
-/// fuse it to an entirely different point's bit than an ordinary wire
-/// would — see this module's doc comment.
-type Lane = (Point, u8);
-
-/// Union-find over pin/wire-endpoint bit lanes.
-struct Dsu {
-    parent: HashMap<Lane, Lane>,
-}
-
-impl Dsu {
-    fn new() -> Self {
-        Dsu { parent: HashMap::new() }
-    }
-
-    fn find(&mut self, p: Lane) -> Lane {
-        let parent = *self.parent.entry(p).or_insert(p);
-        if parent == p {
-            p
-        } else {
-            let root = self.find(parent);
-            self.parent.insert(p, root);
-            root
-        }
-    }
-
-    fn union(&mut self, a: Lane, b: Lane) {
-        let (ra, rb) = (self.find(a), self.find(b));
-        if ra != rb {
-            self.parent.insert(ra, rb);
-        }
-    }
-}
+// `pub` (not just `use`d) since `engine::compile::CompileError` is a real
+// external path (`engine-cli` matches on it) — everything else imported
+// above stays private to this module, same visibility every category
+// submodule's own `use super::{..., CompileError, Geometry, ...}` already
+// relied on when these were defined directly here (a private item/`use` in
+// a module is visible to that module's descendants, not just itself).
+pub use error::CompileError;
 
 /// A circuit's ports, in the order they're exposed when it's used as a
 /// subcircuit: `InputPin`/`OutputPin` components sorted by `id` — simple
@@ -287,13 +172,6 @@ fn compile_leaf(type_: &str, circuit: &Circuit, comp: &ComponentInstance) -> Opt
         .or_else(|| plexers::compile(type_, circuit, comp))
         .or_else(|| arithmetic::compile(type_, circuit, comp))
 }
-
-/// `Value.MAX_WIDTH` — the upper bound for any pin's width, so also the
-/// number of lanes worth unioning at any coincident pair of points. Wires
-/// (and `Splitter` ends) don't know in advance how wide the pins touching
-/// them are, so every wire unconditionally unions all 32; lanes no real pin
-/// ever registers just sit unqueried, harmless.
-const MAX_WIDTH: u8 = 32;
 
 fn compile_circuit(
     circuit: &Circuit,
@@ -550,6 +428,7 @@ pub(crate) mod test_support {
 
 #[cfg(test)]
 mod tests {
+    use super::geometry::SUBCIRCUIT_WIDTH;
     use super::test_support::*;
     use super::*;
     use crate::file_format::{Circuit, ComponentInstance};
