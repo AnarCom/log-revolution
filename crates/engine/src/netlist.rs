@@ -44,6 +44,9 @@ pub enum TemplateNode {
     Xor { bits: u8, inputs: usize },
     Xnor { bits: u8, inputs: usize },
     Buffer { bits: u8 },
+    /// See `Gate::ControlledBuffer`: inputs `data` (`bits`-wide), `enable`
+    /// (1-bit); one `bits`-wide output.
+    ControlledBuffer { bits: u8 },
     Constant { bits: u8, value: u32 },
     InputPin { bits: u8 },
     OutputPin { bits: u8 },
@@ -62,6 +65,9 @@ pub enum TemplateNode {
     /// See `Gate::Demux`: input order is select, then `enable` if
     /// `has_enable`, then the one data line; `2^select_bits` outputs.
     Demux { bits: u8, select_bits: u8, has_enable: bool, disabled_zero: bool, tristate: bool },
+    /// See `Gate::Decoder`: input order is select, then `enable` if
+    /// `has_enable`; `2^select_bits` 1-bit outputs, no data input.
+    Decoder { select_bits: u8, has_enable: bool, disabled_zero: bool, tristate: bool },
     /// See `Gate::Adder`: inputs `in0`, `in1`, `c_in`; outputs `sum`, `c_out`.
     Adder { bits: u8 },
     /// See `Gate::Subtractor`: inputs `in0`, `in1`, `b_in`; outputs `diff`,
@@ -100,6 +106,13 @@ impl TemplateNode {
             | TemplateNode::Xor { bits, .. }
             | TemplateNode::Xnor { bits, .. }
             | TemplateNode::Buffer { bits } => *bits,
+            TemplateNode::ControlledBuffer { bits } => {
+                if pin == 0 {
+                    *bits
+                } else {
+                    1
+                }
+            }
             TemplateNode::OutputPin { bits } => *bits,
             TemplateNode::Register { bits, .. } => {
                 if pin == 0 {
@@ -125,6 +138,13 @@ impl TemplateNode {
                     1
                 } else {
                     *bits
+                }
+            }
+            TemplateNode::Decoder { select_bits, .. } => {
+                if pin == 0 {
+                    *select_bits
+                } else {
+                    1
                 }
             }
             TemplateNode::Adder { bits } | TemplateNode::Subtractor { bits } => {
@@ -153,13 +173,15 @@ impl TemplateNode {
             | TemplateNode::Nor { bits, .. }
             | TemplateNode::Xor { bits, .. }
             | TemplateNode::Xnor { bits, .. }
-            | TemplateNode::Buffer { bits } => *bits,
+            | TemplateNode::Buffer { bits }
+            | TemplateNode::ControlledBuffer { bits } => *bits,
             TemplateNode::Constant { bits, .. } => *bits,
             TemplateNode::InputPin { bits } => *bits,
             TemplateNode::PullResistor(_) => 1,
             TemplateNode::Clock { .. } => 1,
             TemplateNode::Register { bits, .. } => *bits,
             TemplateNode::Mux { bits, .. } | TemplateNode::Demux { bits, .. } => *bits,
+            TemplateNode::Decoder { .. } => 1,
             TemplateNode::Adder { bits } | TemplateNode::Subtractor { bits } => {
                 if pin == 0 {
                     *bits
@@ -354,6 +376,9 @@ fn expand(
             TemplateNode::Buffer { bits } => {
                 local_to_global.insert(local_idx, builder.add_gate(Gate::Buffer { bits: *bits }));
             }
+            TemplateNode::ControlledBuffer { bits } => {
+                local_to_global.insert(local_idx, builder.add_gate(Gate::ControlledBuffer { bits: *bits }));
+            }
             TemplateNode::Constant { bits, value } => {
                 local_to_global.insert(local_idx, builder.add_gate(Gate::Constant { bits: *bits, value: *value }));
             }
@@ -394,6 +419,17 @@ fn expand(
                     local_idx,
                     builder.add_gate(Gate::Demux {
                         bits: *bits,
+                        select_bits: *select_bits,
+                        has_enable: *has_enable,
+                        disabled_zero: *disabled_zero,
+                        tristate: *tristate,
+                    }),
+                );
+            }
+            TemplateNode::Decoder { select_bits, has_enable, disabled_zero, tristate } => {
+                local_to_global.insert(
+                    local_idx,
+                    builder.add_gate(Gate::Decoder {
                         select_bits: *select_bits,
                         has_enable: *has_enable,
                         disabled_zero: *disabled_zero,

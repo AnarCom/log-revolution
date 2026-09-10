@@ -1,4 +1,5 @@
-//! Compiles the multiplexer/demultiplexer: Multiplexer/Demultiplexer.
+//! Compiles the multiplexer/demultiplexer/decoder: Multiplexer/
+//! Demultiplexer/Decoder.
 //!
 //! Attribute keys/defaults match `Plexers.java` verbatim: `"select"`
 //! (`ATTR_SELECT`, `BitWidth` 1..=5, default 1), `"enable"` (`ATTR_ENABLE`,
@@ -64,6 +65,17 @@ fn demux_geometry(n: usize, has_enable: bool) -> Geometry {
     Geometry { inputs, outputs }
 }
 
+/// Same as `demux_geometry` minus the data input — matches `Gate::
+/// Decoder`'s expected input order (select, enable?).
+fn decoder_geometry(n: usize, has_enable: bool) -> Geometry {
+    let mut inputs = vec![(0, -1)]; // select
+    if has_enable {
+        inputs.push((0, -2)); // enable
+    }
+    let outputs = (0..n).map(|i| (3, 2 * i as i32)).collect();
+    Geometry { inputs, outputs }
+}
+
 pub(super) fn compile(type_: &str, circuit: &Circuit, comp: &ComponentInstance) -> Option<Result<(TemplateNode, Geometry), CompileError>> {
     let result = match type_ {
         "core:Multiplexer" => (|| {
@@ -82,6 +94,14 @@ pub(super) fn compile(type_: &str, circuit: &Circuit, comp: &ComponentInstance) 
             let tristate = tristate_attr(comp);
             let n = 1usize << select_bits;
             Ok((TemplateNode::Demux { bits, select_bits, has_enable, disabled_zero, tristate }, demux_geometry(n, has_enable)))
+        })(),
+        "core:Decoder" => (|| {
+            let select_bits = select_attr(circuit, comp)?;
+            let has_enable = enable_attr(comp);
+            let disabled_zero = disabled_zero_attr(circuit, comp)?;
+            let tristate = tristate_attr(comp);
+            let n = 1usize << select_bits;
+            Ok((TemplateNode::Decoder { select_bits, has_enable, disabled_zero, tristate }, decoder_geometry(n, has_enable)))
         })(),
         _ => return None,
     };
@@ -233,5 +253,38 @@ mod tests {
         sim.invoke(0, "on", None).unwrap(); // a = 1
         sim.run_to_quiescence();
         assert_eq!(get_bit(&sim, 4), Bit::One, "no enable pin at all -> always active, still selects a");
+    }
+
+    /// `sel` -> Decoder's select, outputs `o0`/`o1` — placed to coincide
+    /// exactly with `decoder_geometry(2, false)`'s offsets relative to the
+    /// decoder at `(0,0)`. No `enable` attribute given (defaults to
+    /// `true`), left unwired: an unconnected 1-bit `enable` reads `Unknown`
+    /// -> still active (`enable_status`), so this also exercises that path
+    /// end to end, not just via a directly-driven `InputPin` like the mux/
+    /// demux tests above.
+    #[test]
+    fn compiles_and_simulates_a_decoder() {
+        let project = single_circuit_project(Circuit {
+            name: "main".to_string(),
+            components: vec![
+                comp("sel", "core:InputPin", 0, -1),
+                comp("dec", "core:Decoder", 0, 0),
+                comp("o0", "core:OutputPin", 3, 0),
+                comp("o1", "core:OutputPin", 3, 2),
+            ],
+            wires: vec![wire("w1", [0, -1], [0, -1]), wire("w2", [3, 0], [3, 0]), wire("w3", [3, 2], [3, 2])],
+            annotations: vec![],
+        });
+        let library = compile(&project).unwrap();
+        let netlist = flatten(&project.main_circuit, &library).unwrap();
+        let mut sim = Simulation::new(netlist);
+        sim.run_to_quiescence();
+        assert_eq!(get_bit(&sim, 2), Bit::One, "select=0 (default) -> o0 asserted");
+        assert_eq!(get_bit(&sim, 3), Bit::Zero, "o1 idles at Zero (default disabled/tristate options)");
+
+        sim.invoke(0, "on", None).unwrap(); // sel = 1
+        sim.run_to_quiescence();
+        assert_eq!(get_bit(&sim, 2), Bit::Zero, "o0 now idles");
+        assert_eq!(get_bit(&sim, 3), Bit::One, "o1 asserted");
     }
 }

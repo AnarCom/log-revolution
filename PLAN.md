@@ -960,6 +960,54 @@ union-find; направление потока целиком определя�
 label_stay_unconnected` (пустая метка — безобидна, как и в Java). 102
 теста всего, 4 новых, 98 старых не тронуты.
 
+### Ground/Power, Controlled Buffer, Decoder — следующая волна по частоте в реальном проекте
+
+Продолжение того же разбора трёх `.circ` пользователя (CdM-8 + манкала).
+Выбраны по месту в таблице частот после `Tunnel`: `Controlled Buffer` (32),
+`Ground`/`Power` (20/5), `Decoder` (15).
+
+**`Ground`/`Power`** (`std/wiring/Ground.java`/`Power.java`) — оказались не
+отдельным видом узла вообще: `propagate()` у обоих — буквально `state.
+setPort(0, Value.repeat(FALSE/TRUE, width), 1)`, то есть по форме идентично
+`Constant.propagate`'s `setPort(0, Value.createKnown(width, value), 1)`.
+Компилируются напрямую в уже существующий `TemplateNode::Constant` с
+`value=0` (`Ground`) или `value=`все единицы (`Power`) — ни одного нового
+варианта `Gate`/`TemplateNode`, ноль нового рантайм-кода, корректность по
+построению (переиспользуется уже проверенный `Constant`).
+
+**`Controlled Buffer`** (`std/gates/ControlledBuffer.java`, только
+не-инвертирующий вариант `FACTORY_BUFFER` — "Controlled Inverter" ни разу
+не встретился в реальных файлах, поэтому не реализован) — новый `Gate::
+ControlledBuffer { bits }` в категории `logic` (тот же Java-пакет
+`std.gates`). Важная деталь, расходящаяся с уже реализованными `Mux`/
+`Demux`: там неподключённый (`Unknown`) enable по конвенции Logisim
+считается "активным" (`enable_status`). У `ControlledBuffer` — наоборот,
+`Unknown` сгруппирован с `Error` в самом `propagate()` (`else if (control
+== Value.ERROR || control == Value.UNKNOWN)`) — недоопределённый control
+даёт явный `Error` на выходе, а не пропуск данных. Только `control ==
+Zero` даёт ожидаемое "отключено" (`Unknown`/высокий импеданс). Ветка с
+`Value.NIL` (зависящая от глобальной опции проекта "как трактовать
+неопределённый гейт", которую мы не моделируем) недостижима через обычное
+чтение порта — сознательно схлопнута в случай `Zero`.
+
+**`Decoder`** (`std/plexers/Decoder.java`) — в отличие от `ControlledBuffer`,
+полностью повторяет конвенцию `Mux`/`Demux` (`Unknown` enable = активен),
+поэтому переиспользует уже проверенные `decode_select`/`enable_status` из
+`plexers.rs` без изменений. По сути это `Demux` без входа данных и с
+выходами, зафиксированными на 1 бит (`BitWidth data = BitWidth.ONE`
+хардкод в Java) — выбранный выход читает `One`, остальные — `tristate ?
+Unknown : Zero`, при полном отключении — `disabled_zero`-зависимое
+значение, теми же двумя независимыми флагами, что уже были у `Demux`.
+
+Проверено юнит- и компиляционными тестами: 115 тестов всего (было 102),
+13 новых, 102 старых не тронуты. Заодно поправлены все clippy-варнинги,
+копившиеся с прошлых итераций (`if_same_then_else` в `Bit::combine`,
+`should_implement_trait` на `Bit::not` — решено оставить инвариантным
+методом с `#[allow]`, а не переводить на `impl Not`, поскольку это
+потребовало бы `use std::ops::Not;` в каждом файле, где `.not()`
+вызывается, ради нулевой выгоды; плюс мелкие `needless_lifetimes`/
+`needless_range_loop`/`bool_assert_comparison` в `engine`).
+
 ### Совместимость с `.circ` (Logisim) — обязательное требование
 
 Свой JSON-формат выше — не замена, а дополнение. `.circ` (XML-формат

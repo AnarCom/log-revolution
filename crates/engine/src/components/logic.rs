@@ -26,6 +26,7 @@ impl Gate {
             | Gate::Xor { inputs, .. }
             | Gate::Xnor { inputs, .. } => *inputs,
             Gate::Not { .. } | Gate::Buffer { .. } => 1,
+            Gate::ControlledBuffer { .. } => 2, // data, enable
             _ => unreachable!("dispatch bug: not a logic gate"),
         }
     }
@@ -40,13 +41,16 @@ impl Gate {
             Gate::Xor { bits, .. } => vec![fold_xor_one(inputs, *bits)],
             Gate::Xnor { bits, .. } => vec![not_bits(fold_xor_one(inputs, *bits))],
             Gate::Buffer { bits } => vec![(0..*bits as usize).map(|i| bit_at(&inputs[0], i)).collect()],
+            Gate::ControlledBuffer { bits } => vec![controlled_buffer_output(bit_at(&inputs[1], 0), &inputs[0], *bits)],
             _ => unreachable!("dispatch bug: not a logic gate"),
         }
     }
 
     /// Every pin (however many inputs, per `input_count_logic`) is `bits`
-    /// wide — none of these gates has a control pin narrower than its data.
-    pub(super) fn input_width_logic(&self, _pin: usize) -> u8 {
+    /// wide — none of these gates has a control pin narrower than its data,
+    /// except `ControlledBuffer`, whose pin 1 (`enable`) is fixed at 1 bit
+    /// regardless of `bits`.
+    pub(super) fn input_width_logic(&self, pin: usize) -> u8 {
         match self {
             Gate::And { bits, .. }
             | Gate::Or { bits, .. }
@@ -56,6 +60,13 @@ impl Gate {
             | Gate::Xor { bits, .. }
             | Gate::Xnor { bits, .. }
             | Gate::Buffer { bits } => *bits,
+            Gate::ControlledBuffer { bits } => {
+                if pin == 0 {
+                    *bits
+                } else {
+                    1
+                }
+            }
             _ => unreachable!("dispatch bug: not a logic gate"),
         }
     }
@@ -110,6 +121,25 @@ fn fold_xor_one(inputs: &[Signal], bits: u8) -> Signal {
 
 fn not_bits(signal: Signal) -> Signal {
     signal.into_iter().map(Bit::not).collect()
+}
+
+/// `ControlledBuffer.propagate`, verified line-by-line against
+/// `logisim-port`: `control == One` passes `data` through; `Error` *and*
+/// `Unknown` both drive the output to `Error` outright. This is the
+/// opposite convention from `Mux`/`Demux`'s `enable_status` (`plexers.rs`),
+/// where an undriven `Unknown` enable defaults to "active" — here it's
+/// grouped with a genuine conflict instead. Only `control == Zero` gives
+/// the "disabled" reading, `Unknown` (floating/high-Z) — the real source's
+/// remaining branch (`Value.NIL`, gated behind a global "undefined gate"
+/// project option we don't model) is never reachable from a live
+/// `getPort` read, so it's folded into the `Zero` case rather than modeled
+/// separately.
+fn controlled_buffer_output(control: Bit, data: &Signal, bits: u8) -> Signal {
+    match control {
+        Bit::One => (0..bits as usize).map(|i| bit_at(data, i)).collect(),
+        Bit::Error | Bit::Unknown => vec![Bit::Error; bits as usize],
+        Bit::Zero => vec![Bit::Unknown; bits as usize],
+    }
 }
 
 #[cfg(test)]
@@ -180,6 +210,39 @@ mod tests {
         let mut buf = Gate::Buffer { bits: 1 };
         assert_eq!(buf.eval(&[vec![Bit::One]]), vec![vec![Bit::One]]);
         assert_eq!(buf.delay(), 1);
+    }
+
+    #[test]
+    fn controlled_buffer_passes_data_through_when_enabled() {
+        let mut cb = Gate::ControlledBuffer { bits: 4 };
+        // inputs: [data, enable]
+        let out = cb.eval(&[vec![Bit::One, Bit::Zero, Bit::One, Bit::One], vec![Bit::One]]);
+        assert_eq!(out, vec![vec![Bit::One, Bit::Zero, Bit::One, Bit::One]]);
+        assert_eq!(cb.delay(), 1);
+    }
+
+    #[test]
+    fn controlled_buffer_disabled_floats_not_zero() {
+        let mut cb = Gate::ControlledBuffer { bits: 4 };
+        let out = cb.eval(&[vec![Bit::One, Bit::One, Bit::One, Bit::One], vec![Bit::Zero]]);
+        assert_eq!(out, vec![vec![Bit::Unknown; 4]]);
+    }
+
+    /// The key divergence from `Mux`/`Demux`'s `enable_status`: there, an
+    /// undriven (`Unknown`) enable defaults to "active". Here it's grouped
+    /// with `Error` instead — verified against `ControlledBuffer.propagate`.
+    #[test]
+    fn controlled_buffer_undriven_enable_yields_error_not_passthrough() {
+        let mut cb = Gate::ControlledBuffer { bits: 2 };
+        let out = cb.eval(&[vec![Bit::One, Bit::One], vec![Bit::Unknown]]);
+        assert_eq!(out, vec![vec![Bit::Error, Bit::Error]]);
+    }
+
+    #[test]
+    fn controlled_buffer_conflicting_enable_drivers_yield_error() {
+        let mut cb = Gate::ControlledBuffer { bits: 2 };
+        let out = cb.eval(&[vec![Bit::One, Bit::One], vec![Bit::Error]]);
+        assert_eq!(out, vec![vec![Bit::Error, Bit::Error]]);
     }
 
     #[test]

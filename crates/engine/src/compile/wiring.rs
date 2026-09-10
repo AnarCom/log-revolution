@@ -1,5 +1,12 @@
 //! Compiles the sources/sinks/pull resistor: Constant/InputPin/OutputPin/
-//! PullResistor.
+//! PullResistor/Ground/Power.
+//!
+//! `Ground`/`Power` aren't their own runtime node kind — both are exactly a
+//! fixed-value source (`Ground.propagate`/`Power.propagate`, verified: each
+//! is `state.setPort(0, Value.repeat(FALSE/TRUE, width), 1)`, the same
+//! shape as `Constant.propagate`'s `setPort(0, Value.createKnown(width,
+//! value), 1)`), so they compile straight to `TemplateNode::Constant` with
+//! `value` fixed at `0`/all-ones instead of read from an attribute.
 
 use super::{sink_geometry, source_geometry, width_attr, CompileError, Geometry};
 use crate::file_format::{Circuit, ComponentInstance};
@@ -27,11 +34,23 @@ fn value_attr(comp: &ComponentInstance) -> u32 {
     comp.attrs.get("value").and_then(|v| v.as_i64()).unwrap_or(0) as u32
 }
 
+/// All `bits` low bits set — `Power`'s fixed value. Written to avoid `1u32
+/// << 32` overflow at the top of `width_attr`'s own 1..=32 range.
+fn all_ones(bits: u8) -> u32 {
+    if bits == 32 {
+        u32::MAX
+    } else {
+        (1u32 << bits) - 1
+    }
+}
+
 pub(super) fn compile(type_: &str, circuit: &Circuit, comp: &ComponentInstance) -> Option<Result<(TemplateNode, Geometry), CompileError>> {
     Some(match type_ {
         "core:Constant" => {
             width_attr(circuit, comp).map(|bits| (TemplateNode::Constant { bits, value: value_attr(comp) }, source_geometry()))
         }
+        "core:Ground" => width_attr(circuit, comp).map(|bits| (TemplateNode::Constant { bits, value: 0 }, source_geometry())),
+        "core:Power" => width_attr(circuit, comp).map(|bits| (TemplateNode::Constant { bits, value: all_ones(bits) }, source_geometry())),
         "core:InputPin" => width_attr(circuit, comp).map(|bits| (TemplateNode::InputPin { bits }, source_geometry())),
         "core:OutputPin" => width_attr(circuit, comp).map(|bits| (TemplateNode::OutputPin { bits }, sink_geometry())),
         "core:PullResistor" => pull_target(circuit, comp).map(|to| (TemplateNode::PullResistor(to), source_geometry())),
@@ -96,5 +115,54 @@ mod tests {
         let mut sim = Simulation::new(netlist);
         sim.run_to_quiescence();
         assert_eq!(get_bits(&sim, 2), vec![Bit::One, Bit::Zero, Bit::One]); // 0b101 LSB-first
+    }
+
+    /// `Ground`/`Power` compile straight to `TemplateNode::Constant` (see
+    /// this module's doc comment) — both ends of a 3-bit bus, verified
+    /// through a live simulation rather than just inspecting the compiled
+    /// node.
+    #[test]
+    fn ground_and_power_drive_all_zero_and_all_one_at_their_configured_width() {
+        let mut w3 = BTreeMap::new();
+        w3.insert("width".to_string(), json!(3));
+        let project = single_circuit_project(Circuit {
+            name: "main".to_string(),
+            components: vec![
+                ComponentInstance { attrs: w3.clone(), ..comp("g", "core:Ground", 0, 0) },
+                ComponentInstance { attrs: w3.clone(), ..comp("gout", "core:OutputPin", 3, 0) },
+                ComponentInstance { attrs: w3.clone(), ..comp("p", "core:Power", 0, 10) },
+                ComponentInstance { attrs: w3, ..comp("pout", "core:OutputPin", 3, 10) },
+            ],
+            wires: vec![wire("w1", [0, 0], [3, 0]), wire("w2", [0, 10], [3, 10])],
+            annotations: vec![],
+        });
+        let library = compile(&project).unwrap();
+        let netlist = flatten(&project.main_circuit, &library).unwrap();
+        let mut sim = Simulation::new(netlist);
+        sim.run_to_quiescence();
+        assert_eq!(get_bits(&sim, 1), vec![Bit::Zero, Bit::Zero, Bit::Zero], "Ground");
+        assert_eq!(get_bits(&sim, 3), vec![Bit::One, Bit::One, Bit::One], "Power");
+    }
+
+    /// `Power` at the full `MAX_WIDTH` boundary — guards `all_ones` against
+    /// the `1u32 << 32` overflow a naive mask formula would hit there.
+    #[test]
+    fn power_at_width_thirty_two_does_not_overflow_the_mask() {
+        let mut w32 = BTreeMap::new();
+        w32.insert("width".to_string(), json!(32));
+        let project = single_circuit_project(Circuit {
+            name: "main".to_string(),
+            components: vec![
+                ComponentInstance { attrs: w32.clone(), ..comp("p", "core:Power", 0, 0) },
+                ComponentInstance { attrs: w32, ..comp("out", "core:OutputPin", 3, 0) },
+            ],
+            wires: vec![wire("w1", [0, 0], [3, 0])],
+            annotations: vec![],
+        });
+        let library = compile(&project).unwrap();
+        let netlist = flatten(&project.main_circuit, &library).unwrap();
+        let mut sim = Simulation::new(netlist);
+        sim.run_to_quiescence();
+        assert_eq!(get_bits(&sim, 1), vec![Bit::One; 32]);
     }
 }

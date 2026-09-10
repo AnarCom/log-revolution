@@ -73,6 +73,8 @@ impl Gate {
             Gate::Mux { select_bits, has_enable, .. } => (1usize << select_bits) + 1 + (*has_enable as usize),
             // select, then enable?, then the one data line.
             Gate::Demux { has_enable, .. } => 2 + (*has_enable as usize),
+            // select, then enable? — no data line at all, unlike Demux.
+            Gate::Decoder { has_enable, .. } => 1 + (*has_enable as usize),
             _ => unreachable!("dispatch bug: not a plexer"),
         }
     }
@@ -81,6 +83,8 @@ impl Gate {
     /// `select_bits` wide, the optional enable (index n+1) is 1 bit.
     /// Demux: select (index 0) is `select_bits` wide, the optional enable
     /// (index 1) is 1 bit, the one data line (last index) is `bits` wide.
+    /// Decoder: select (index 0) is `select_bits` wide, the optional enable
+    /// (index 1) is 1 bit — same as Demux minus the data line.
     pub(super) fn input_width_plexers(&self, pin: usize) -> u8 {
         match self {
             Gate::Mux { bits, select_bits, .. } => {
@@ -102,15 +106,26 @@ impl Gate {
                     *bits
                 }
             }
+            Gate::Decoder { select_bits, .. } => {
+                if pin == 0 {
+                    *select_bits
+                } else {
+                    1
+                }
+            }
             _ => unreachable!("dispatch bug: not a plexer"),
         }
     }
 
-    /// Every output pin (Mux's one, or Demux's `2^select_bits`) is `bits`
-    /// wide.
+    /// Every output pin (Mux's one, Demux's `2^select_bits`, each `bits`
+    /// wide) — except `Decoder`, whose outputs are fixed at 1 bit each
+    /// regardless of any `bits` attribute (it doesn't have one: `Decoder`
+    /// only ever routes a constant `One`, verified in `Decoder.java`'s
+    /// `propagate`, which hardcodes `BitWidth data = BitWidth.ONE`).
     pub(super) fn output_width_plexers(&self, _pin: usize) -> u8 {
         match self {
             Gate::Mux { bits, .. } | Gate::Demux { bits, .. } => *bits,
+            Gate::Decoder { .. } => 1,
             _ => unreachable!("dispatch bug: not a plexer"),
         }
     }
@@ -159,6 +174,24 @@ impl Gate {
                 };
 
                 (0..n).map(|i| if Some(i) == selected { active.clone() } else { idle.clone() }).collect()
+            }
+            Gate::Decoder { select_bits, has_enable, disabled_zero, tristate } => {
+                let n = 1usize << *select_bits;
+                let en = if *has_enable { bit_at(&inputs[1], 0) } else { Bit::One };
+
+                // Same decision tree as `Demux` above, minus a data line to
+                // route — the selected output is just a fixed `One`.
+                let (selected, idle): (Option<usize>, Bit) = match enable_status(en) {
+                    EnableStatus::Disabled => (None, if *disabled_zero { Bit::Zero } else { Bit::Unknown }),
+                    EnableStatus::ConflictError => (None, Bit::Error),
+                    EnableStatus::Active => match decode_select(&inputs[0], *select_bits) {
+                        Select::Defined(idx) => (Some(idx), if *tristate { Bit::Unknown } else { Bit::Zero }),
+                        Select::Error => (None, Bit::Error),
+                        Select::Undefined => (None, Bit::Unknown),
+                    },
+                };
+
+                (0..n).map(|i| vec![if Some(i) == selected { Bit::One } else { idle }]).collect()
             }
             _ => unreachable!("dispatch bug: not a plexer"),
         }
@@ -273,5 +306,46 @@ mod tests {
         let mut d = demux(1);
         let out = d.eval(&[vec![Bit::Error], vec![Bit::One], vec![Bit::One]]);
         assert_eq!(out, vec![vec![Bit::Error], vec![Bit::Error]]);
+    }
+
+    fn decoder(select_bits: u8) -> Gate {
+        Gate::Decoder { select_bits, has_enable: true, disabled_zero: false, tristate: false }
+    }
+
+    #[test]
+    fn decoder_asserts_the_selected_output_others_default_to_zero() {
+        let mut d = decoder(1); // 2 outputs
+        // inputs: [select, enable]
+        let out = d.eval(&[vec![Bit::One], vec![Bit::One]]);
+        assert_eq!(out, vec![vec![Bit::Zero], vec![Bit::One]], "select=1 -> output[1]=One, output[0] idles at Zero");
+    }
+
+    #[test]
+    fn decoder_tristate_option_idles_at_unknown_instead_of_zero() {
+        let mut d = Gate::Decoder { select_bits: 1, has_enable: true, disabled_zero: false, tristate: true };
+        let out = d.eval(&[vec![Bit::One], vec![Bit::One]]);
+        assert_eq!(out, vec![vec![Bit::Unknown], vec![Bit::One]]);
+    }
+
+    #[test]
+    fn decoder_disabled_sets_every_output_uniformly() {
+        let mut d = decoder(1);
+        let out = d.eval(&[vec![Bit::One], vec![Bit::Zero]]); // en=0
+        assert_eq!(out, vec![vec![Bit::Unknown], vec![Bit::Unknown]]);
+    }
+
+    #[test]
+    fn decoder_select_error_makes_every_output_error() {
+        let mut d = decoder(1);
+        let out = d.eval(&[vec![Bit::Error], vec![Bit::One]]);
+        assert_eq!(out, vec![vec![Bit::Error], vec![Bit::Error]]);
+    }
+
+    #[test]
+    fn decoder_without_enable_pin_is_always_active() {
+        let mut d = Gate::Decoder { select_bits: 1, has_enable: false, disabled_zero: false, tristate: false };
+        // inputs: [select] — no enable pin at all.
+        let out = d.eval(&[vec![Bit::Zero]]);
+        assert_eq!(out, vec![vec![Bit::One], vec![Bit::Zero]]);
     }
 }

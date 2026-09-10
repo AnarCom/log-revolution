@@ -1,4 +1,5 @@
-//! Compiles the combinational gates: And/Or/Nand/Nor/Xor/Xnor/Not/Buffer.
+//! Compiles the combinational gates: And/Or/Nand/Nor/Xor/Xnor/Not/Buffer/
+//! ControlledBuffer.
 
 use super::{unary_geometry, width_attr, CompileError, Geometry};
 use crate::file_format::{Circuit, ComponentInstance};
@@ -15,6 +16,14 @@ fn variadic_gate_geometry(inputs: usize) -> Geometry {
         inputs: (0..inputs).map(|i| (0, 2 * i as i32 - (n - 1))).collect(),
         outputs: vec![(3, 0)],
     }
+}
+
+/// `ControlledBuffer`: data input dead center (matching `unary_geometry`'s
+/// own input point, so its width lines up the same way), enable tucked out
+/// of the way at `(1, -2)`, output two units east — matches `Gate::
+/// ControlledBuffer`'s expected input order (`data`, `enable`).
+fn controlled_buffer_geometry() -> Geometry {
+    Geometry { inputs: vec![(0, 0), (1, -2)], outputs: vec![(2, 0)] }
 }
 
 /// `attrs["inputs"]`, defaulting to 2 — rejected outright if outside 2..=32
@@ -48,6 +57,9 @@ pub(super) fn compile(type_: &str, circuit: &Circuit, comp: &ComponentInstance) 
         })(),
         "core:NotGate" => width_attr(circuit, comp).map(|bits| (TemplateNode::Not { bits }, unary_geometry())),
         "core:Buffer" => width_attr(circuit, comp).map(|bits| (TemplateNode::Buffer { bits }, unary_geometry())),
+        "core:ControlledBuffer" => {
+            width_attr(circuit, comp).map(|bits| (TemplateNode::ControlledBuffer { bits }, controlled_buffer_geometry()))
+        }
         _ => return None,
     };
     Some(result)
@@ -191,5 +203,40 @@ mod tests {
             compile(&project).unwrap_err(),
             CompileError::InvalidInputCount { circuit: "main".to_string(), id: "g".to_string(), value: 1 }
         );
+    }
+
+    /// `data`/`enable` -> `ControlledBuffer`'s two inputs, `out` reads the
+    /// output — placed to coincide exactly with `controlled_buffer_
+    /// geometry`'s offsets relative to the buffer at `(0,0)`.
+    #[test]
+    fn compiles_and_simulates_a_controlled_buffer() {
+        let mut w4 = BTreeMap::new();
+        w4.insert("width".to_string(), json!(4));
+        let project = single_circuit_project(Circuit {
+            name: "main".to_string(),
+            components: vec![
+                ComponentInstance { attrs: w4.clone(), ..comp("data", "core:InputPin", 0, 0) },
+                comp("en", "core:InputPin", 1, -2),
+                ComponentInstance { attrs: w4.clone(), ..comp("cb", "core:ControlledBuffer", 0, 0) },
+                ComponentInstance { attrs: w4, ..comp("out", "core:OutputPin", 2, 0) },
+            ],
+            wires: vec![wire("w1", [0, 0], [0, 0]), wire("w2", [1, -2], [1, -2]), wire("w3", [2, 0], [2, 0])],
+            annotations: vec![],
+        });
+        let library = compile(&project).unwrap();
+        let netlist = flatten(&project.main_circuit, &library).unwrap();
+        let mut sim = Simulation::new(netlist);
+
+        sim.invoke(0, "set", Some(Value::Int(0b1010))).unwrap(); // data
+        sim.run_to_quiescence();
+        assert_eq!(get_bits(&sim, 3), vec![Bit::Unknown; 4], "enable defaults to 0 (InputPin's own default) -> disabled/floating");
+
+        sim.invoke(1, "on", None).unwrap(); // enable = 1
+        sim.run_to_quiescence();
+        assert_eq!(get_bits(&sim, 3), vec![Bit::Zero, Bit::One, Bit::Zero, Bit::One], "enabled -> data passes through");
+
+        sim.invoke(1, "off", None).unwrap(); // enable = 0
+        sim.run_to_quiescence();
+        assert_eq!(get_bits(&sim, 3), vec![Bit::Unknown; 4], "disabled -> floating");
     }
 }
