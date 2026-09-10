@@ -809,6 +809,7 @@ version = "0.0.0"
 dependencies = [
  "engine",
  "plugin-abi",
+ "serde_json",
 ]
 
 [[package]]

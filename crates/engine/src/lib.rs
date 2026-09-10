@@ -1,3 +1,4 @@
+pub mod compile;
 pub mod components;
 pub mod file_format;
 pub mod netlist;

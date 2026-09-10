@@ -228,6 +228,7 @@ mod tests {
             connections: vec![((0, 0), (2, 0)), ((1, 0), (2, 1)), ((2, 0), (3, 0))],
             input_ports: Vec::new(),
             output_ports: Vec::new(),
+            port_marker_nodes: Vec::new(),
         }
     }
 
@@ -257,7 +258,8 @@ mod tests {
             nodes: vec![TemplateNode::And], // 0
             connections: Vec::new(),
             input_ports: vec![vec![(0, 0)], vec![(0, 1)]],
-            output_ports: vec![(0, 0)],
+            output_ports: vec![vec![(0, 0)]],
+            port_marker_nodes: Vec::new(),
         }
     }
 
@@ -286,6 +288,7 @@ mod tests {
             ],
             input_ports: Vec::new(),
             output_ports: Vec::new(),
+            port_marker_nodes: Vec::new(),
         }
     }
 
@@ -324,6 +327,7 @@ mod tests {
             connections: vec![((0, 0), (2, 0)), ((1, 0), (2, 0))],
             input_ports: Vec::new(),
             output_ports: Vec::new(),
+            port_marker_nodes: Vec::new(),
         }
     }
 
@@ -372,6 +376,7 @@ mod tests {
             ],
             input_ports: Vec::new(),
             output_ports: Vec::new(),
+            port_marker_nodes: Vec::new(),
         }
     }
 
@@ -406,6 +411,7 @@ mod tests {
             connections: vec![((0, 0), (2, 0)), ((1, 0), (2, 0))],
             input_ports: Vec::new(),
             output_ports: Vec::new(),
+            port_marker_nodes: Vec::new(),
         }
     }
 
@@ -440,6 +446,7 @@ mod tests {
                 connections: vec![((0, 0), (1, 0))],
                 input_ports: Vec::new(),
                 output_ports: Vec::new(),
+                port_marker_nodes: Vec::new(),
             },
         );
         let netlist = flatten("main", &library).unwrap();
@@ -464,6 +471,7 @@ mod tests {
                 connections: vec![((0, 0), (3, 0)), ((1, 0), (3, 0)), ((2, 0), (3, 0))],
                 input_ports: Vec::new(),
                 output_ports: Vec::new(),
+                port_marker_nodes: Vec::new(),
             },
         );
         let netlist = flatten("main", &library).unwrap();
