@@ -69,6 +69,12 @@ pub enum TemplateNode {
     Subtractor { bits: u8 },
     /// See `Gate::Comparator`: inputs `in0`, `in1`; outputs `gt`, `eq`, `lt`.
     Comparator { bits: u8, signed: bool },
+    /// See `Gate::Multiplier`: inputs `in0`, `in1`, `c_in`; outputs `sum`,
+    /// `c_out` (every pin `bits`-wide).
+    Multiplier { bits: u8 },
+    /// See `Gate::Divider`: inputs `in0`, `in1`, `upper`; outputs `out`,
+    /// `rem` (every pin `bits`-wide).
+    Divider { bits: u8 },
     /// Reference to another `CircuitTemplate` by name, resolved during
     /// `flatten`. As a connection endpoint, its pins are numbered
     /// `0..input_ports.len()` for inputs then `input_ports.len()..` for
@@ -128,7 +134,7 @@ impl TemplateNode {
                     1
                 }
             }
-            TemplateNode::Comparator { bits, .. } => *bits,
+            TemplateNode::Comparator { bits, .. } | TemplateNode::Multiplier { bits } | TemplateNode::Divider { bits } => *bits,
             TemplateNode::Constant { .. }
             | TemplateNode::InputPin { .. }
             | TemplateNode::PullResistor(_)
@@ -162,6 +168,7 @@ impl TemplateNode {
                 }
             }
             TemplateNode::Comparator { .. } => 1,
+            TemplateNode::Multiplier { bits } | TemplateNode::Divider { bits } => *bits,
             TemplateNode::OutputPin { .. } => unreachable!("OutputPin has no output pins"),
             TemplateNode::Subcircuit(_) => unreachable!("Subcircuit width is resolved via the port-width table"),
         }
@@ -402,6 +409,12 @@ fn expand(
             }
             TemplateNode::Comparator { bits, signed } => {
                 local_to_global.insert(local_idx, builder.add_gate(Gate::Comparator { bits: *bits, signed: *signed }));
+            }
+            TemplateNode::Multiplier { bits } => {
+                local_to_global.insert(local_idx, builder.add_gate(Gate::Multiplier { bits: *bits }));
+            }
+            TemplateNode::Divider { bits } => {
+                local_to_global.insert(local_idx, builder.add_gate(Gate::Divider { bits: *bits }));
             }
             TemplateNode::Subcircuit(sub_name) => {
                 let (ports, _) = expand(sub_name, library, builder, stack, false)?;

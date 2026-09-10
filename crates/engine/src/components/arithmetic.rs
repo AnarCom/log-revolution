@@ -1,5 +1,5 @@
-//! Adder/Subtractor/Comparator (`std/arith/Adder.java`/`Subtractor.java`/
-//! `Comparator.java`).
+//! Adder/Subtractor/Comparator/Multiplier/Divider (`std/arith/Adder.java`/
+//! `Subtractor.java`/`Comparator.java`/`Multiplier.java`/`Divider.java`).
 //!
 //! `Adder.computeSum` in the Java source has *two* code paths: a fast one
 //! that packs operands into a native `int`/`long` and relies on
@@ -25,8 +25,21 @@
 //! table *is* the definition of binary addition, not an approximation of
 //! it. Same "elementwise fold over `Bit`, not reimplemented native
 //! arithmetic" principle as `logic.rs`'s multi-bit gates.
+//!
+//! `Multiplier.computeProduct`/`Divider.computeResult`, unlike `Adder`,
+//! *do* have real, verified width-32 bugs in their fast paths — see PLAN.md
+//! for the full numeric trace. Both cast a signed-representable-as-negative
+//! Java `int` to `long` *without* masking (`(long) a.toIntValue()`,
+//! `(long) upper.toIntValue() << w`), so a width-32 operand whose top bit
+//! is set gets *sign*-extended instead of zero-extended, silently
+//! corrupting the result. `eval_arithmetic` below reimplements both with
+//! plain `u32 -> u64` (lossless, zero-extending by construction — Rust has
+//! no signed/unsigned ambiguity to fall into here) rather than replicating
+//! the bug for "fidelity" — a `.circ`-compatible *behavior* model doesn't
+//! mean preserving a host-language representation accident that never had
+//! any hardware meaning to begin with.
 
-use super::{bit_at, Gate};
+use super::{bit_at, signal_to_u32_if_defined, u32_to_signal, zeros, Gate};
 use plugin_abi::{Bit, Signal};
 
 /// `Adder.computeSum`'s bit-serial branch, used unconditionally (see this
@@ -78,11 +91,38 @@ fn ripple_carry_add(a: &Signal, b: &Signal, c_in: Bit, bits: u8) -> (Signal, Bit
     (out, carry)
 }
 
+/// Shared by `Multiplier`'s `c_in` and `Divider`'s `upper`: both are
+/// *width*-wide carry-chain inputs (unlike `Adder`/`Subtractor`'s
+/// single-bit `c_in`/`b_in`), and Logisim only treats a *wholly*-floating
+/// one as "unconnected -> zero" (`Value.isUnknown()`'s own definition:
+/// every bit `Unknown`, none `Error` — verified in `Value.java`). A
+/// *partially*-defined word is left alone, which then fails the
+/// fully-defined fast-path check in `eval_arithmetic` and falls through to
+/// the conservative Error/Unknown handling — there's no in-between
+/// "half-computed" case the way `Multiplier.computeProduct`'s own Java
+/// fallback attempts (see PLAN.md for why that finer-grained heuristic
+/// wasn't worth replicating bit-for-bit).
+fn coerce_if_wholly_unknown(signal: &Signal, bits: u8) -> Signal {
+    if signal.iter().all(|&b| b == Bit::Unknown) {
+        zeros(bits)
+    } else {
+        signal.clone()
+    }
+}
+
+fn has_error(signal: &Signal) -> bool {
+    signal.contains(&Bit::Error)
+}
+
+fn mask64(bits: u8) -> u64 {
+    (1u64 << bits) - 1
+}
+
 impl Gate {
     pub(super) fn input_count_arithmetic(&self) -> usize {
         match self {
-            Gate::Adder { .. } | Gate::Subtractor { .. } => 3, // in0, in1, carry/borrow-in
-            Gate::Comparator { .. } => 2,                      // in0, in1
+            Gate::Adder { .. } | Gate::Subtractor { .. } | Gate::Multiplier { .. } | Gate::Divider { .. } => 3, // in0, in1, carry/borrow-in/upper
+            Gate::Comparator { .. } => 2,                                                                       // in0, in1
             _ => unreachable!("dispatch bug: not an arithmetic gate"),
         }
     }
@@ -96,7 +136,10 @@ impl Gate {
                     1
                 }
             }
-            Gate::Comparator { bits, .. } => *bits,
+            // `Multiplier`'s c_in / `Divider`'s upper are *width*-wide,
+            // unlike `Adder`/`Subtractor`'s single-bit carry — every pin is
+            // uniformly `bits` wide.
+            Gate::Comparator { bits, .. } | Gate::Multiplier { bits } | Gate::Divider { bits } => *bits,
             _ => unreachable!("dispatch bug: not an arithmetic gate with inputs"),
         }
     }
@@ -111,6 +154,7 @@ impl Gate {
                 }
             }
             Gate::Comparator { .. } => 1, // gt, eq, lt are always single bits
+            Gate::Multiplier { bits } | Gate::Divider { bits } => *bits, // both outputs are width-wide
             _ => unreachable!("dispatch bug: not an arithmetic gate with outputs"),
         }
     }
@@ -173,6 +217,53 @@ impl Gate {
                     }
                 }
                 vec![vec![gt], vec![eq], vec![lt]]
+            }
+            // `Multiplier.computeProduct`: `in0 * in1 + c_in`, split into a
+            // `bits`-wide `sum`/low word and a `bits`-wide `c_out`/high
+            // word — `u32 -> u64` is a lossless zero-extension (unlike
+            // Java's fast path, see this module's doc comment), so no
+            // masking trick is needed to stay correct at width 32; `mask64`
+            // just slices out each `bits`-wide half of the up-to-64-bit
+            // product; `bits <= 32` (enforced at compile time) keeps that
+            // product `< 2^64`, never overflowing `u64`.
+            Gate::Multiplier { bits } => {
+                let c_in = coerce_if_wholly_unknown(&inputs[2], *bits);
+                let (a, b) = (&inputs[0], &inputs[1]);
+                match (signal_to_u32_if_defined(a, *bits), signal_to_u32_if_defined(b, *bits), signal_to_u32_if_defined(&c_in, *bits)) {
+                    (Some(av), Some(bv), Some(cv)) => {
+                        let product = (av as u64) * (bv as u64) + (cv as u64);
+                        let mask = mask64(*bits);
+                        vec![u32_to_signal((product & mask) as u32, *bits), u32_to_signal(((product >> *bits) & mask) as u32, *bits)]
+                    }
+                    _ => {
+                        let out = if has_error(a) || has_error(b) || has_error(&c_in) { Bit::Error } else { Bit::Unknown };
+                        vec![vec![out; *bits as usize], vec![out; *bits as usize]]
+                    }
+                }
+            }
+            // `Divider.computeResult`: `(upper:in0)` (a `2*bits`-wide
+            // dividend) divided by `in1`, giving a `bits`-wide quotient and
+            // remainder. `den == 0` divides by `1` instead — not an error —
+            // matching `Divider.java`'s own choice exactly, unusual as it
+            // is. All-`u64` unsigned throughout, so (unlike `Divider.
+            // computeResult`'s verified bug, this module's doc comment)
+            // there's no negative-remainder correction to get right: an
+            // unsigned division is never negative to begin with.
+            Gate::Divider { bits } => {
+                let upper = coerce_if_wholly_unknown(&inputs[2], *bits);
+                let (a, b) = (&inputs[0], &inputs[1]);
+                match (signal_to_u32_if_defined(a, *bits), signal_to_u32_if_defined(b, *bits), signal_to_u32_if_defined(&upper, *bits)) {
+                    (Some(av), Some(bv), Some(uv)) => {
+                        let num = ((uv as u64) << *bits) | (av as u64);
+                        let den = if bv == 0 { 1u64 } else { bv as u64 };
+                        let mask = mask64(*bits);
+                        vec![u32_to_signal(((num / den) & mask) as u32, *bits), u32_to_signal(((num % den) & mask) as u32, *bits)]
+                    }
+                    _ => {
+                        let out = if has_error(a) || has_error(b) || has_error(&upper) { Bit::Error } else { Bit::Unknown };
+                        vec![vec![out; *bits as usize], vec![out; *bits as usize]]
+                    }
+                }
             }
             _ => unreachable!("dispatch bug: not an arithmetic gate"),
         }
@@ -268,5 +359,115 @@ mod tests {
         let mut g = Gate::Comparator { bits: 4, signed: true };
         let out = g.eval(&[bits(&[1, 0, 1, 0]), bits(&[1, 0, 1, 0])]);
         assert_eq!(out, vec![vec![Bit::Zero], vec![Bit::One], vec![Bit::Zero]]);
+    }
+
+    #[test]
+    fn multiplies_two_defined_numbers_splitting_low_and_high_words() {
+        let mut g = Gate::Multiplier { bits: 4 };
+        // 12 * 5 = 60 = 0x3C: low nibble 0xC (1100), high nibble 0x3 (0011).
+        let out = g.eval(&[bits(&[0, 0, 1, 1]), bits(&[1, 0, 1, 0]), vec![Bit::Zero; 4]]);
+        assert_eq!(out, vec![bits(&[0, 0, 1, 1]), bits(&[1, 1, 0, 0])]);
+    }
+
+    #[test]
+    fn multiplier_floating_carry_in_defaults_to_zero() {
+        let mut g = Gate::Multiplier { bits: 4 };
+        let out = g.eval(&[bits(&[0, 0, 1, 1]), bits(&[1, 0, 1, 0]), vec![Bit::Unknown; 4]]);
+        assert_eq!(out, vec![bits(&[0, 0, 1, 1]), bits(&[1, 1, 0, 0])], "wholly-floating c_in acts as zero, same as a wired-in zero");
+    }
+
+    #[test]
+    fn multiplier_partially_floating_carry_in_is_not_coerced_and_yields_unknown() {
+        let mut g = Gate::Multiplier { bits: 4 };
+        // Only *wholly* unknown gets coerced (`Value.isUnknown()`'s own
+        // rule) — one determined bit among the rest keeps it "not fully
+        // defined", falling to the Unknown/Error fallback rather than being
+        // silently treated as zero.
+        let out = g.eval(&[bits(&[0, 0, 1, 1]), bits(&[1, 0, 1, 0]), vec![Bit::Zero, Bit::Unknown, Bit::Zero, Bit::Zero]]);
+        assert_eq!(out, vec![vec![Bit::Unknown; 4], vec![Bit::Unknown; 4]]);
+    }
+
+    #[test]
+    fn multiplier_at_width_32_does_not_sign_extend_a_top_bit_set_operand() {
+        // The exact scenario `Multiplier.computeProduct`'s Java fast path
+        // gets wrong (PLAN.md): a = 2^31 (top bit set), b = 2. True product
+        // = 2^32 exactly, so the low word is all-zero and the high word is
+        // exactly 1 — Java's sign-extending cast instead produces
+        // 0xFFFFFFFF for the high word. `u32 -> u64` here is a lossless
+        // zero-extension, so this must come out right without any special
+        // casing.
+        let mut g = Gate::Multiplier { bits: 32 };
+        let mut a = vec![Bit::Zero; 32];
+        a[31] = Bit::One; // 2^31
+        let mut b = vec![Bit::Zero; 32];
+        b[1] = Bit::One; // 2
+        let out = g.eval(&[a, b, vec![Bit::Zero; 32]]);
+        assert_eq!(out[0], vec![Bit::Zero; 32], "low word: 2^32 mod 2^32 = 0");
+        let mut expected_high = vec![Bit::Zero; 32];
+        expected_high[0] = Bit::One;
+        assert_eq!(out[1], expected_high, "high word: 2^32 / 2^32 = 1, not Java's 0xFFFFFFFF");
+    }
+
+    #[test]
+    fn multiplier_error_bit_poisons_both_outputs() {
+        let mut g = Gate::Multiplier { bits: 4 };
+        let out = g.eval(&[vec![Bit::Zero, Bit::Error, Bit::Zero, Bit::Zero], bits(&[1, 0, 1, 0]), vec![Bit::Zero; 4]]);
+        assert_eq!(out, vec![vec![Bit::Error; 4], vec![Bit::Error; 4]]);
+    }
+
+    #[test]
+    fn divides_with_a_nonzero_remainder() {
+        let mut g = Gate::Divider { bits: 4 };
+        // 13 / 4 = 3 remainder 1.
+        let out = g.eval(&[bits(&[1, 0, 1, 1]), bits(&[0, 0, 1, 0]), vec![Bit::Zero; 4]]);
+        assert_eq!(out, vec![bits(&[1, 1, 0, 0]), bits(&[1, 0, 0, 0])], "quotient=3, remainder=1");
+    }
+
+    #[test]
+    fn divider_division_by_zero_acts_as_division_by_one_not_an_error() {
+        let mut g = Gate::Divider { bits: 4 };
+        // `Divider.java`'s own unusual choice: b=0 is silently treated as
+        // b=1 (quotient = dividend, remainder = 0), not flagged as `Error`.
+        let out = g.eval(&[bits(&[1, 0, 1, 0]), vec![Bit::Zero; 4], vec![Bit::Zero; 4]]);
+        assert_eq!(out, vec![bits(&[1, 0, 1, 0]), vec![Bit::Zero; 4]]);
+    }
+
+    #[test]
+    fn divider_floating_upper_half_defaults_to_zero() {
+        let mut g = Gate::Divider { bits: 4 };
+        let out = g.eval(&[bits(&[1, 0, 1, 1]), bits(&[0, 0, 1, 0]), vec![Bit::Unknown; 4]]);
+        assert_eq!(out, vec![bits(&[1, 1, 0, 0]), bits(&[1, 0, 0, 0])], "wholly-floating upper acts as zero");
+    }
+
+    #[test]
+    fn divider_at_width_32_treats_the_dividend_as_unsigned_across_the_boundary() {
+        // The exact scenario `Divider.computeResult`'s Java fast path gets
+        // wrong (PLAN.md): `upper` = 2^31 (top bit set) turns the true
+        // unsigned dividend `2^63 + a` into something Java's *signed* `long`
+        // division misreads entirely (its own negative-remainder
+        // "correction" doesn't fully compensate). Unsigned `u64` here needs
+        // no correction at all: `num = upper*2^32 + a`, `num / den`, `num %
+        // den` are already correct as plain unsigned division.
+        let mut g = Gate::Divider { bits: 32 };
+        let mut upper = vec![Bit::Zero; 32];
+        upper[31] = Bit::One; // 2^31
+        let mut a = vec![Bit::Zero; 32];
+        a[0] = Bit::One; // dividend low word = 1, so num = 2^63 + 1
+        let mut b = vec![Bit::Zero; 32];
+        b[1] = Bit::One; // divisor = 2
+        let out = g.eval(&[a, b, upper]);
+        // (2^63 + 1) / 2 = 2^62 (remainder 1) — 2^62's bit pattern in the
+        // low 32 bits is all-zero (2^62 = 1 << 62, well above bit 31).
+        assert_eq!(out[0], vec![Bit::Zero; 32], "quotient's low 32 bits: 2^62 has no bits below bit 32 set");
+        let mut expected_rem = vec![Bit::Zero; 32];
+        expected_rem[0] = Bit::One;
+        assert_eq!(out[1], expected_rem, "remainder = 1");
+    }
+
+    #[test]
+    fn divider_error_bit_poisons_both_outputs() {
+        let mut g = Gate::Divider { bits: 4 };
+        let out = g.eval(&[vec![Bit::Zero, Bit::Error, Bit::Zero, Bit::Zero], bits(&[0, 0, 1, 0]), vec![Bit::Zero; 4]]);
+        assert_eq!(out, vec![vec![Bit::Error; 4], vec![Bit::Error; 4]]);
     }
 }

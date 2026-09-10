@@ -128,6 +128,20 @@ pub enum Gate {
     /// `"twosComplement"`/`"unsigned"`) only changes how the *top* bit's
     /// mismatch is read — see `arithmetic::eval_arithmetic`.
     Comparator { bits: u8, signed: bool },
+    /// `std/arith/Multiplier.java`: `in0 * in1 + c_in`, split into a
+    /// `bits`-wide low word (`sum`) and `bits`-wide high word (`c_out`) —
+    /// **not** a native-int port of `computeProduct`'s fast path, which has
+    /// a verified width-32 sign-extension bug (PLAN.md,
+    /// `arithmetic::eval_arithmetic`'s doc). Input order: `in0`, `in1`,
+    /// `c_in` (all `bits`-wide, unlike `Adder`'s single-bit carry); output
+    /// order: `sum`, `c_out`.
+    Multiplier { bits: u8 },
+    /// `std/arith/Divider.java`: `(upper:in0) / in1`, `(upper:in0) % in1` —
+    /// **not** a native-int port of `computeResult`'s fast path, which has
+    /// its own verified width-32 bug (`(long) upper.toIntValue() << w`
+    /// sign-extends what should be an unsigned dividend). Input order:
+    /// `in0`, `in1`, `upper` (all `bits`-wide); output order: `out`, `rem`.
+    Divider { bits: u8 },
 }
 
 /// One input pin's bit `i`, or `Unknown` if that pin is unconnected/narrower
@@ -219,6 +233,11 @@ impl Gate {
             // `Subtractor.java` — a couple extra ticks over `Adder` for the
             // two `not()`s bracketing the shared adder.
             Gate::Subtractor { bits } => *bits as u64 + 4,
+            // `width * (width + 2) * PER_DELAY`, verified in
+            // `Multiplier.java`/`Divider.java` — quadratic in width,
+            // matching how much slower real multiply/divide hardware is
+            // than a plain adder.
+            Gate::Multiplier { bits } | Gate::Divider { bits } => *bits as u64 * (*bits as u64 + 2),
         }
     }
 
@@ -246,7 +265,7 @@ impl Gate {
             Gate::Clock { .. } | Gate::Register { .. } => self.input_width_memory(pin),
             Gate::Constant { .. } | Gate::InputPin { .. } | Gate::OutputPin { .. } | Gate::PullResistor { .. } => self.input_width_wiring(pin),
             Gate::Mux { .. } | Gate::Demux { .. } => self.input_width_plexers(pin),
-            Gate::Adder { .. } | Gate::Subtractor { .. } | Gate::Comparator { .. } => self.input_width_arithmetic(pin),
+            Gate::Adder { .. } | Gate::Subtractor { .. } | Gate::Comparator { .. } | Gate::Multiplier { .. } | Gate::Divider { .. } => self.input_width_arithmetic(pin),
             _ => self.input_width_logic(pin),
         }
     }
@@ -259,7 +278,7 @@ impl Gate {
             Gate::Clock { .. } | Gate::Register { .. } => self.output_width_memory(pin),
             Gate::Constant { .. } | Gate::InputPin { .. } | Gate::OutputPin { .. } | Gate::PullResistor { .. } => self.output_width_wiring(pin),
             Gate::Mux { .. } | Gate::Demux { .. } => self.output_width_plexers(pin),
-            Gate::Adder { .. } | Gate::Subtractor { .. } | Gate::Comparator { .. } => self.output_width_arithmetic(pin),
+            Gate::Adder { .. } | Gate::Subtractor { .. } | Gate::Comparator { .. } | Gate::Multiplier { .. } | Gate::Divider { .. } => self.output_width_arithmetic(pin),
             _ => self.output_width_logic(pin),
         }
     }
@@ -282,7 +301,7 @@ impl Component for Gate {
             Gate::Clock { .. } | Gate::Register { .. } => self.input_count_memory(),
             Gate::Constant { .. } | Gate::InputPin { .. } | Gate::OutputPin { .. } | Gate::PullResistor { .. } => self.input_count_wiring(),
             Gate::Mux { .. } | Gate::Demux { .. } => self.input_count_plexers(),
-            Gate::Adder { .. } | Gate::Subtractor { .. } | Gate::Comparator { .. } => self.input_count_arithmetic(),
+            Gate::Adder { .. } | Gate::Subtractor { .. } | Gate::Comparator { .. } | Gate::Multiplier { .. } | Gate::Divider { .. } => self.input_count_arithmetic(),
             _ => self.input_count_logic(),
         }
     }
@@ -293,7 +312,7 @@ impl Component for Gate {
             // The only gate kind with more than one output pin — everything
             // else (including `Mux`) is exactly 1.
             Gate::Demux { select_bits, .. } => 1usize << select_bits,
-            Gate::Adder { .. } | Gate::Subtractor { .. } => 2, // sum/diff, carry/borrow-out
+            Gate::Adder { .. } | Gate::Subtractor { .. } | Gate::Multiplier { .. } | Gate::Divider { .. } => 2, // sum/diff, carry/borrow-out
             Gate::Comparator { .. } => 3,                      // gt, eq, lt
             _ => 1,
         }
@@ -304,7 +323,7 @@ impl Component for Gate {
             Gate::Clock { .. } | Gate::Register { .. } => self.eval_memory(inputs),
             Gate::Constant { .. } | Gate::InputPin { .. } | Gate::OutputPin { .. } | Gate::PullResistor { .. } => self.eval_wiring(inputs),
             Gate::Mux { .. } | Gate::Demux { .. } => self.eval_plexers(inputs),
-            Gate::Adder { .. } | Gate::Subtractor { .. } | Gate::Comparator { .. } => self.eval_arithmetic(inputs),
+            Gate::Adder { .. } | Gate::Subtractor { .. } | Gate::Comparator { .. } | Gate::Multiplier { .. } | Gate::Divider { .. } => self.eval_arithmetic(inputs),
             _ => self.eval_logic(inputs),
         }
     }

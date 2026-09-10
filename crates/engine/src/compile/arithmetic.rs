@@ -1,5 +1,6 @@
-//! Compiles the arithmetic components: Adder/Subtractor/Comparator
-//! (`std/arith/Adder.java`/`Subtractor.java`/`Comparator.java`).
+//! Compiles the arithmetic components: Adder/Subtractor/Comparator/
+//! Multiplier/Divider (`std/arith/Adder.java`/`Subtractor.java`/
+//! `Comparator.java`/`Multiplier.java`/`Divider.java`).
 
 use super::{width_attr, CompileError, Geometry};
 use crate::file_format::{Circuit, ComponentInstance};
@@ -49,6 +50,13 @@ pub(super) fn compile(type_: &str, circuit: &Circuit, comp: &ComponentInstance) 
             let signed = signed_attr(circuit, comp)?;
             Ok((TemplateNode::Comparator { bits, signed }, comparator_geometry()))
         })(),
+        // Same port layout as `Adder`/`Subtractor` (`adder_geometry`): two
+        // data inputs, a width-wide carry/upper-half input, and two
+        // width-wide outputs — see `Gate::Multiplier`/`Divider`'s doc for
+        // why every pin here is `bits`-wide, unlike `Adder`'s single-bit
+        // carry.
+        "core:Multiplier" => width_attr(circuit, comp).map(|bits| (TemplateNode::Multiplier { bits }, adder_geometry())),
+        "core:Divider" => width_attr(circuit, comp).map(|bits| (TemplateNode::Divider { bits }, adder_geometry())),
         _ => return None,
     };
     Some(result)
@@ -185,5 +193,80 @@ mod tests {
             compile(&project).unwrap_err(),
             CompileError::InvalidComparatorMode { circuit: "main".to_string(), id: "cmp".to_string(), value: "bogus".to_string() }
         );
+    }
+
+    /// Same layout as the adder test, but `cin` is now `bits`-wide (not
+    /// 1-bit) — `Multiplier`'s carry chain, unlike `Adder`'s, is a full
+    /// word (see `Gate::Multiplier`'s doc for why).
+    #[test]
+    fn compiles_and_simulates_a_multiplier() {
+        let mut w4 = BTreeMap::new();
+        w4.insert("width".to_string(), json!(4));
+        let project = single_circuit_project(Circuit {
+            name: "main".to_string(),
+            components: vec![
+                ComponentInstance { attrs: w4.clone(), ..comp("a", "core:InputPin", 0, -1) },
+                ComponentInstance { attrs: w4.clone(), ..comp("b", "core:InputPin", 0, 1) },
+                ComponentInstance { attrs: w4.clone(), ..comp("cin", "core:InputPin", 1, -2) },
+                ComponentInstance { attrs: w4.clone(), ..comp("mul", "core:Multiplier", 0, 0) },
+                ComponentInstance { attrs: w4.clone(), ..comp("sum", "core:OutputPin", 3, 0) },
+                ComponentInstance { attrs: w4, ..comp("cout", "core:OutputPin", 1, 2) },
+            ],
+            wires: vec![
+                wire("w1", [0, -1], [0, -1]),
+                wire("w2", [0, 1], [0, 1]),
+                wire("w3", [1, -2], [1, -2]),
+                wire("w4", [3, 0], [3, 0]),
+                wire("w5", [1, 2], [1, 2]),
+            ],
+            annotations: vec![],
+        });
+
+        let library = compile(&project).unwrap();
+        let netlist = flatten(&project.main_circuit, &library).unwrap();
+        let mut sim = Simulation::new(netlist);
+
+        sim.invoke(0, "set", Some(Value::Int(12))).unwrap();
+        sim.invoke(1, "set", Some(Value::Int(5))).unwrap();
+        sim.run_to_quiescence();
+        // 12 * 5 = 60 = 0x3C: low nibble 0xC, high nibble 0x3.
+        assert_eq!(get_bits(&sim, 4), vec![Bit::Zero, Bit::Zero, Bit::One, Bit::One], "low word 0xC");
+        assert_eq!(get_bits(&sim, 5), vec![Bit::One, Bit::One, Bit::Zero, Bit::Zero], "high word 0x3");
+    }
+
+    /// Same layout, `upper` (the dividend's high half) is `bits`-wide.
+    #[test]
+    fn compiles_and_simulates_a_divider() {
+        let mut w4 = BTreeMap::new();
+        w4.insert("width".to_string(), json!(4));
+        let project = single_circuit_project(Circuit {
+            name: "main".to_string(),
+            components: vec![
+                ComponentInstance { attrs: w4.clone(), ..comp("a", "core:InputPin", 0, -1) },
+                ComponentInstance { attrs: w4.clone(), ..comp("b", "core:InputPin", 0, 1) },
+                ComponentInstance { attrs: w4.clone(), ..comp("upper", "core:InputPin", 1, -2) },
+                ComponentInstance { attrs: w4.clone(), ..comp("div", "core:Divider", 0, 0) },
+                ComponentInstance { attrs: w4.clone(), ..comp("out", "core:OutputPin", 3, 0) },
+                ComponentInstance { attrs: w4, ..comp("rem", "core:OutputPin", 1, 2) },
+            ],
+            wires: vec![
+                wire("w1", [0, -1], [0, -1]),
+                wire("w2", [0, 1], [0, 1]),
+                wire("w3", [1, -2], [1, -2]),
+                wire("w4", [3, 0], [3, 0]),
+                wire("w5", [1, 2], [1, 2]),
+            ],
+            annotations: vec![],
+        });
+
+        let library = compile(&project).unwrap();
+        let netlist = flatten(&project.main_circuit, &library).unwrap();
+        let mut sim = Simulation::new(netlist);
+
+        sim.invoke(0, "set", Some(Value::Int(13))).unwrap();
+        sim.invoke(1, "set", Some(Value::Int(4))).unwrap();
+        sim.run_to_quiescence();
+        assert_eq!(get_bits(&sim, 4), vec![Bit::One, Bit::One, Bit::Zero, Bit::Zero], "quotient = 3");
+        assert_eq!(get_bits(&sim, 5), vec![Bit::One, Bit::Zero, Bit::Zero, Bit::Zero], "remainder = 1");
     }
 }
