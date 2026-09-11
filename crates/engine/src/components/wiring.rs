@@ -1,5 +1,5 @@
 //! Sources, sinks, and the pull resistor: Constant/InputPin/OutputPin/
-//! PullResistor/BitExtender/HexDigit.
+//! PullResistor/BitExtender/HexDigit/Transistor.
 //!
 //! `HexDigit`'s `value` is always 8 bits (`digit`'s 4 bits, `dot`'s 1 bit,
 //! and the 7-segment lookup below never touch anything past that) —
@@ -28,7 +28,7 @@ impl Gate {
             Gate::HexDigit { value } => *value = zeros(8),
             // Not runtime state to reset — fixed at instantiation (an
             // attribute in Logisim terms, not simulated state).
-            Gate::Constant { .. } | Gate::PullResistor { .. } | Gate::BitExtender { .. } => {}
+            Gate::Constant { .. } | Gate::PullResistor { .. } | Gate::BitExtender { .. } | Gate::Transistor { .. } => {}
             _ => unreachable!("dispatch bug: not a wiring gate"),
         }
     }
@@ -37,6 +37,7 @@ impl Gate {
         match self {
             Gate::OutputPin { .. } => 1,
             Gate::BitExtender { mode, .. } => 1 + (*mode == ExtendMode::Input) as usize,
+            Gate::Transistor { .. } => 2, // input, gate
             Gate::HexDigit { .. } => 2, // digit, dot
             // Real Logisim's `propagate` is a no-op for these too — none of
             // them ever react to anything, they're all sources.
@@ -62,6 +63,13 @@ impl Gate {
                     1 // dot
                 }
             }
+            Gate::Transistor { bits, .. } => {
+                if pin == 0 {
+                    *bits // input
+                } else {
+                    1 // gate
+                }
+            }
             _ => unreachable!("dispatch bug: not a wiring gate with an input"),
         }
     }
@@ -73,6 +81,7 @@ impl Gate {
             Gate::Constant { bits, .. } | Gate::InputPin { bits, .. } => *bits,
             Gate::PullResistor { .. } => 1,
             Gate::BitExtender { out_bits, .. } => *out_bits,
+            Gate::Transistor { bits, .. } => *bits,
             _ => unreachable!("dispatch bug: not a wiring gate with an output"),
         }
     }
@@ -110,6 +119,9 @@ impl Gate {
                 let dot = bit_at(&inputs[1], 0);
                 *value = u32_to_signal(hex_digit_summary(digit, dot) as u32, 8);
                 Vec::new()
+            }
+            Gate::Transistor { bits, conducts_on } => {
+                vec![transistor_output(bit_at(&inputs[1], 0), &inputs[0], *bits, *conducts_on)]
             }
             _ => unreachable!("dispatch bug: not a wiring gate"),
         }
@@ -248,6 +260,33 @@ fn hex_digit_summary(digit: &Signal, dot: Bit) -> u8 {
     summary
 }
 
+/// `Transistor.computeOutput`, verified line-by-line. `gate` conducting
+/// (`gate == conducts_on`, both fully defined) passes `input` straight
+/// through, undisturbed — including any `Unknown`/`Error` bits already in
+/// it. `gate` fully defined but *not* conducting floats every bit
+/// (`Unknown`, high-impedance). An indeterminate `gate` is the one
+/// non-obvious branch: a fully-defined `input` is forced to `Error`
+/// outright, but a not-fully-defined `input` is mapped per bit instead —
+/// `Unknown` bits stay `Unknown`, every other bit (whether it was `Zero`,
+/// `One`, or already `Error`) becomes `Error`. That per-bit distinction
+/// only has an observable effect while `input` is partway between defined
+/// and undefined; the two rules agree once it settles either way.
+fn transistor_output(gate: Bit, input: &Signal, bits: u8, conducts_on: Bit) -> Signal {
+    match gate {
+        Bit::Zero | Bit::One if gate == conducts_on => (0..bits as usize).map(|i| bit_at(input, i)).collect(),
+        Bit::Zero | Bit::One => vec![Bit::Unknown; bits as usize],
+        Bit::Unknown | Bit::Error => {
+            if signal_to_u32_if_defined(input, bits).is_some() {
+                vec![Bit::Error; bits as usize]
+            } else {
+                (0..bits as usize)
+                    .map(|i| if bit_at(input, i) == Bit::Unknown { Bit::Unknown } else { Bit::Error })
+                    .collect()
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -379,5 +418,60 @@ mod tests {
         let mut h = Gate::HexDigit { value: zeros(8) };
         h.eval(&[vec![Bit::Zero, Bit::One, Bit::Unknown, Bit::Zero], vec![Bit::Zero]]);
         assert_eq!(h.read("get"), Ok(Value::Bits(u32_to_signal(0b0100_0000, 8))));
+    }
+
+    fn transistor_eval(t: &mut Gate, input: Signal, gate: Bit) -> Signal {
+        t.eval(&[input, vec![gate]])[0].clone()
+    }
+
+    /// P-type conducts on `gate == Zero` (`Value.FALSE`, `ATTR_TYPE`'s
+    /// default) — passes `input` through undisturbed, `Unknown`/`Error`
+    /// bits included, not just a clean value.
+    #[test]
+    fn p_type_transistor_passes_input_through_when_gate_is_zero() {
+        let mut t = Gate::Transistor { bits: 3, conducts_on: Bit::Zero };
+        let input = vec![Bit::One, Bit::Unknown, Bit::Error];
+        assert_eq!(transistor_eval(&mut t, input.clone(), Bit::Zero), input);
+    }
+
+    /// P-type with `gate == One` (fully defined, just not `conducts_on`) —
+    /// floats every bit, doesn't just block the input.
+    #[test]
+    fn p_type_transistor_floats_when_gate_is_one() {
+        let mut t = Gate::Transistor { bits: 3, conducts_on: Bit::Zero };
+        let out = transistor_eval(&mut t, vec![Bit::One, Bit::One, Bit::One], Bit::One);
+        assert_eq!(out, vec![Bit::Unknown; 3]);
+    }
+
+    /// N-type is the mirror image: conducts on `gate == One`.
+    #[test]
+    fn n_type_transistor_conducts_on_gate_one_not_zero() {
+        let mut t = Gate::Transistor { bits: 2, conducts_on: Bit::One };
+        assert_eq!(transistor_eval(&mut t, vec![Bit::One, Bit::Zero], Bit::One), vec![Bit::One, Bit::Zero]);
+        assert_eq!(transistor_eval(&mut t, vec![Bit::One, Bit::Zero], Bit::Zero), vec![Bit::Unknown, Bit::Unknown]);
+    }
+
+    /// An indeterminate `gate` (`Unknown`/`Error`) with a *fully-defined*
+    /// `input` forces `Error` outright — not `Unknown`, and not a
+    /// per-bit pass of `input`.
+    #[test]
+    fn transistor_undefined_gate_with_defined_input_forces_error() {
+        let mut t = Gate::Transistor { bits: 3, conducts_on: Bit::Zero };
+        let out = transistor_eval(&mut t, vec![Bit::One, Bit::Zero, Bit::One], Bit::Unknown);
+        assert_eq!(out, vec![Bit::Error; 3]);
+        let out = transistor_eval(&mut t, vec![Bit::One, Bit::Zero, Bit::One], Bit::Error);
+        assert_eq!(out, vec![Bit::Error; 3]);
+    }
+
+    /// The one branch that genuinely differs from `ControlledBuffer`'s
+    /// coarser "any Unknown gate -> Error" rule: an indeterminate gate with
+    /// a *partially* undefined input maps per bit — `Unknown` stays
+    /// `Unknown`, everything else (including bits that were already
+    /// cleanly `Zero`/`One`) becomes `Error`.
+    #[test]
+    fn transistor_undefined_gate_with_partially_undefined_input_maps_per_bit() {
+        let mut t = Gate::Transistor { bits: 3, conducts_on: Bit::Zero };
+        let out = transistor_eval(&mut t, vec![Bit::One, Bit::Unknown, Bit::Error], Bit::Unknown);
+        assert_eq!(out, vec![Bit::Error, Bit::Unknown, Bit::Error]);
     }
 }

@@ -106,6 +106,19 @@ pub enum Gate {
     /// to Java's own `default` branch; not per-bit error propagation.
     /// Input order: `digit`, `dot`.
     HexDigit { value: Signal },
+    /// `std/wiring/Transistor.java`: a directional, gated pass-through —
+    /// `output` mirrors `input` (`bits`-wide) exactly when the 1-bit `gate`
+    /// pin equals `conducts_on` (`Bit::Zero` for a P-type transistor,
+    /// `Bit::One` for N-type — `ATTR_TYPE`'s two options, `Value.FALSE`/
+    /// `Value.TRUE` respectively in `computeOutput`), else floats
+    /// (`Unknown`). When `gate` itself isn't fully defined (`Unknown`/
+    /// `Error`), the result depends on `input`: a fully-defined `input`
+    /// forces `Error` outright, but a *not*-fully-defined `input` maps
+    /// per-bit instead (`Unknown` bits stay `Unknown`, every other bit
+    /// becomes `Error`) — verified line-by-line against `computeOutput`,
+    /// not the coarser "any Unknown gate -> Error" rule `ControlledBuffer`
+    /// uses. Input order: `input`, `gate`.
+    Transistor { bits: u8, conducts_on: Bit },
     /// A square-wave source — but *not* its own independent timer. Real
     /// Logisim has exactly one global tick counter for the whole
     /// simulation (`Propagator.ticks`); every `Clock` instance is a pure
@@ -333,7 +346,12 @@ impl Gate {
             // same instant): unlike `Constant`/`InputPin`, `BitExtender`
             // has a real input, so it can genuinely be fed within the same
             // batch.
-            | Gate::BitExtender { .. } => 1,
+            | Gate::BitExtender { .. }
+            // `state.setPort(OUTPUT, ..., 1)`, verified in `Transistor.
+            // propagate` — same reasoning as `BitExtender` just above, a
+            // real input pin that can genuinely be fed within the same
+            // batch.
+            | Gate::Transistor { .. } => 1,
             Gate::Register { .. } => 8,
             // `Mem.DELAY`, verified in `Mem.java` — shared by `Rom`/`Ram`.
             Gate::Rom { .. } | Gate::Ram { .. } => 10,
@@ -391,6 +409,7 @@ impl Gate {
             | Gate::OutputPin { .. }
             | Gate::PullResistor { .. }
             | Gate::BitExtender { .. }
+            | Gate::Transistor { .. }
             | Gate::HexDigit { .. } => self.input_width_wiring(pin),
             Gate::Mux { .. } | Gate::Demux { .. } | Gate::Decoder { .. } | Gate::PriorityEncoder { .. } => self.input_width_plexers(pin),
             Gate::Adder { .. } | Gate::Subtractor { .. } | Gate::Comparator { .. } | Gate::Multiplier { .. } | Gate::Divider { .. } => self.input_width_arithmetic(pin),
@@ -409,6 +428,7 @@ impl Gate {
             | Gate::OutputPin { .. }
             | Gate::PullResistor { .. }
             | Gate::BitExtender { .. }
+            | Gate::Transistor { .. }
             | Gate::HexDigit { .. } => self.output_width_wiring(pin),
             Gate::Mux { .. } | Gate::Demux { .. } | Gate::Decoder { .. } | Gate::PriorityEncoder { .. } => self.output_width_plexers(pin),
             Gate::Adder { .. } | Gate::Subtractor { .. } | Gate::Comparator { .. } | Gate::Multiplier { .. } | Gate::Divider { .. } => self.output_width_arithmetic(pin),
@@ -437,6 +457,7 @@ impl Component for Gate {
             | Gate::OutputPin { .. }
             | Gate::PullResistor { .. }
             | Gate::BitExtender { .. }
+            | Gate::Transistor { .. }
             | Gate::HexDigit { .. } => self.input_count_wiring(),
             Gate::Mux { .. } | Gate::Demux { .. } | Gate::Decoder { .. } | Gate::PriorityEncoder { .. } => self.input_count_plexers(),
             Gate::Adder { .. } | Gate::Subtractor { .. } | Gate::Comparator { .. } | Gate::Multiplier { .. } | Gate::Divider { .. } => self.input_count_arithmetic(),
@@ -465,6 +486,7 @@ impl Component for Gate {
             | Gate::OutputPin { .. }
             | Gate::PullResistor { .. }
             | Gate::BitExtender { .. }
+            | Gate::Transistor { .. }
             | Gate::HexDigit { .. } => self.eval_wiring(inputs),
             Gate::Mux { .. } | Gate::Demux { .. } | Gate::Decoder { .. } | Gate::PriorityEncoder { .. } => self.eval_plexers(inputs),
             Gate::Adder { .. } | Gate::Subtractor { .. } | Gate::Comparator { .. } | Gate::Multiplier { .. } | Gate::Divider { .. } => self.eval_arithmetic(inputs),

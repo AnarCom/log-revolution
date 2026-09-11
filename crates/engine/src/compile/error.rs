@@ -49,4 +49,7 @@ pub enum CompileError {
     /// `attrs["bus"]` for `core:Ram` isn't one of `Ram.java`'s own three
     /// option strings (`"combined"`/`"asynch"`/`"separate"`).
     InvalidRamBus { circuit: String, id: String, value: String },
+    /// `attrs["type"]` for `core:Transistor` isn't one of `Transistor.java`'s
+    /// own two option strings (`"p"`/`"n"`).
+    InvalidTransistorType { circuit: String, id: String, value: String },
 }

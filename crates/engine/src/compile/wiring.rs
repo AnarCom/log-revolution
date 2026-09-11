@@ -1,5 +1,6 @@
 //! Compiles the sources/sinks/pull resistor: Constant/InputPin/OutputPin/
-//! PullResistor/Ground/Power/LED/Button/BitExtender/HexDigit.
+//! PullResistor/Ground/Power/LED/Button/BitExtender/HexDigit/Probe/
+//! Transistor.
 //!
 //! `Ground`/`Power` aren't their own runtime node kind — both are exactly a
 //! fixed-value source (`Ground.propagate`/`Power.propagate`, verified: each
@@ -17,6 +18,18 @@
 //! `TRUE`/`FALSE` on press/release — exactly `InputPin { bits: 1 }`'s
 //! existing `on`/`off` actions (verified: both default to `Value.FALSE`
 //! absent any interaction, same as `InputPin`'s own zeroed initial value).
+//!
+//! `Probe` (`std/wiring/Probe.java`) is the same shape again: `propagate`
+//! just remembers whatever its single input port reads, for display, no
+//! side effect on the rest of the circuit — verbatim `OutputPin`'s own
+//! `eval_wiring`. The one real difference from `LED` is width: Java's
+//! `Probe` port is `BitWidth.UNKNOWN` and the instance grows/shrinks to
+//! match whatever net it lands on (`propagate` calls `recomputeBounds`
+//! when the width changes) — true per-net width inference. This engine
+//! doesn't do net-width inference anywhere yet (the same known gap already
+//! flagged for `PullResistor` in PLAN.md §14), so `Probe` takes an
+//! explicit `"width"` attribute instead, same as `OutputPin`, rather than
+//! inventing a one-off inference path for this one component.
 
 use super::{sink_geometry, source_geometry, width_attr, CompileError, Geometry};
 use crate::components::ExtendMode;
@@ -105,6 +118,28 @@ fn hex_digit_geometry() -> Geometry {
     Geometry { inputs: vec![(0, 0), (0, -2)], outputs: vec![] }
 }
 
+/// `attrs["type"]` for `core:Transistor` — `Transistor.java`'s own
+/// `ATTR_TYPE` (`"p"`/`"n"`), returned already resolved to the `Bit` a
+/// conducting gate must equal (`Value.FALSE` for P-type, `Value.TRUE` for
+/// N-type, verified in `computeOutput`) rather than as a separate enum —
+/// nothing else in the engine needs to distinguish P/N beyond that one
+/// bit. Defaults to `"p"`, matching `TYPE_P` in the Java constructor's own
+/// attribute defaults.
+fn conducts_on_attr(circuit: &Circuit, comp: &ComponentInstance) -> Result<Bit, CompileError> {
+    let raw = comp.attrs.get("type").and_then(|v| v.as_str()).unwrap_or("p");
+    match raw {
+        "p" => Ok(Bit::Zero),
+        "n" => Ok(Bit::One),
+        other => Err(CompileError::InvalidTransistorType { circuit: circuit.name.clone(), id: comp.id.clone(), value: other.to_string() }),
+    }
+}
+
+/// `input` dead center, `gate` tucked at `(0, -2)`, `output` two units east
+/// — matches `Gate::Transistor`'s expected input order (`input`, `gate`).
+fn transistor_geometry() -> Geometry {
+    Geometry { inputs: vec![(0, 0), (0, -2)], outputs: vec![(2, 0)] }
+}
+
 pub(super) fn compile(type_: &str, circuit: &Circuit, comp: &ComponentInstance) -> Option<Result<(TemplateNode, Geometry), CompileError>> {
     Some(match type_ {
         "core:Constant" => {
@@ -116,6 +151,7 @@ pub(super) fn compile(type_: &str, circuit: &Circuit, comp: &ComponentInstance) 
         "core:OutputPin" => width_attr(circuit, comp).map(|bits| (TemplateNode::OutputPin { bits }, sink_geometry())),
         "core:PullResistor" => pull_target(circuit, comp).map(|to| (TemplateNode::PullResistor(to), source_geometry())),
         "core:Led" => Ok((TemplateNode::OutputPin { bits: 1 }, sink_geometry())),
+        "core:Probe" => width_attr(circuit, comp).map(|bits| (TemplateNode::OutputPin { bits }, sink_geometry())),
         "core:Button" => Ok((TemplateNode::InputPin { bits: 1 }, source_geometry())),
         "core:BitExtender" => (|| {
             let in_bits = in_width_attr(circuit, comp)?;
@@ -124,6 +160,11 @@ pub(super) fn compile(type_: &str, circuit: &Circuit, comp: &ComponentInstance) 
             Ok((TemplateNode::BitExtender { in_bits, out_bits, mode }, bit_extender_geometry(mode == ExtendMode::Input)))
         })(),
         "core:HexDigit" => Ok((TemplateNode::HexDigit, hex_digit_geometry())),
+        "core:Transistor" => (|| {
+            let bits = width_attr(circuit, comp)?;
+            let conducts_on = conducts_on_attr(circuit, comp)?;
+            Ok((TemplateNode::Transistor { bits, conducts_on }, transistor_geometry()))
+        })(),
         _ => return None,
     })
 }
@@ -282,6 +323,68 @@ mod tests {
         sim.invoke(0, "off", None).unwrap(); // release
         sim.run_to_quiescence();
         assert_eq!(get_bit(&sim, 1), Bit::Zero);
+    }
+
+    /// `Probe` compiles straight to `TemplateNode::OutputPin { bits }`
+    /// (see this module's doc comment), width taken from its own `"width"`
+    /// attribute rather than hardcoded like `Led` — exercised at 3 bits so
+    /// this actually differs from `led_reflects_its_driven_input` above.
+    #[test]
+    fn probe_reflects_a_multi_bit_driven_input() {
+        let mut w3 = BTreeMap::new();
+        w3.insert("width".to_string(), json!(3));
+        let project = single_circuit_project(Circuit {
+            name: "main".to_string(),
+            components: vec![
+                ComponentInstance { attrs: w3.clone(), ..comp("in", "core:InputPin", 0, 0) },
+                ComponentInstance { attrs: w3, ..comp("probe", "core:Probe", 3, 0) },
+            ],
+            wires: vec![wire("w1", [0, 0], [3, 0])],
+            annotations: vec![],
+        });
+        let library = compile(&project).unwrap();
+        let netlist = flatten(&project.main_circuit, &library).unwrap();
+        let mut sim = Simulation::new(netlist);
+        sim.run_to_quiescence();
+        assert_eq!(get_bits(&sim, 1), vec![Bit::Zero, Bit::Zero, Bit::Zero]);
+
+        sim.invoke(0, "set", Some(Value::Int(0b101))).unwrap();
+        sim.run_to_quiescence();
+        assert_eq!(get_bits(&sim, 1), vec![Bit::One, Bit::Zero, Bit::One]);
+    }
+
+    /// `Transistor` compiles to `TemplateNode::Transistor { bits,
+    /// conducts_on }` — a live simulation through a P-type transistor
+    /// (`"type"` defaults to `"p"`, so left unset here on purpose to
+    /// exercise the default), gated by an `InputPin`.
+    #[test]
+    fn compiles_and_simulates_a_p_type_transistor_gated_by_an_input() {
+        let mut w2 = BTreeMap::new();
+        w2.insert("width".to_string(), json!(2));
+        let project = single_circuit_project(Circuit {
+            name: "main".to_string(),
+            components: vec![
+                ComponentInstance { attrs: w2.clone(), ..comp("data", "core:InputPin", 0, 0) },
+                comp("gate", "core:InputPin", 0, -2),
+                ComponentInstance { attrs: w2.clone(), ..comp("t", "core:Transistor", 0, 0) },
+                ComponentInstance { attrs: w2, ..comp("out", "core:OutputPin", 2, 0) },
+            ],
+            wires: vec![wire("w1", [0, 0], [0, 0]), wire("w2", [0, -2], [0, -2]), wire("w3", [2, 0], [2, 0])],
+            annotations: vec![],
+        });
+        let library = compile(&project).unwrap();
+        let netlist = flatten(&project.main_circuit, &library).unwrap();
+        let mut sim = Simulation::new(netlist);
+
+        sim.invoke(0, "set", Some(Value::Int(0b10))).unwrap(); // data
+        // gate defaults to Zero (InputPin's own zeroed initial value) ->
+        // P-type conducts (`conducts_on == Zero`) without pressing anything.
+        sim.run_to_quiescence();
+        assert_eq!(get_bits(&sim, 3), vec![Bit::Zero, Bit::One]);
+
+        sim.invoke(1, "on", None).unwrap(); // gate = One -> P-type stops conducting
+        sim.run_to_quiescence();
+        assert_eq!(get_bits(&sim, 3), vec![Bit::Unknown, Bit::Unknown]);
     }
 
     /// `in`/`extend`/`out` -> `BitExtender`'s two inputs and output —
