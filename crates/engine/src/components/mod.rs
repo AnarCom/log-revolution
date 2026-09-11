@@ -24,11 +24,13 @@
 //! category's logic and tests into their own file.
 
 mod arithmetic;
+mod io;
 mod logic;
 mod memory;
 mod plexers;
 mod wiring;
 
+pub use io::DotMatrixInput;
 pub use memory::{RamBus, Trigger};
 pub use wiring::ExtendMode;
 
@@ -247,6 +249,102 @@ pub enum Gate {
     /// sign-extends what should be an unsigned dividend). Input order:
     /// `in0`, `in1`, `upper` (all `bits`-wide); output order: `out`, `rem`.
     Divider { bits: u8 },
+    /// `std/memory/Random.java`: a free-running PRNG register — `out` holds
+    /// the current value; `next` (gated by `trigger`'s edge, reusing the
+    /// same 2-option `Trigger::Rising`/`Falling` `Random` itself offers via
+    /// `StdAttr.EDGE_TRIGGER`) advances it, `reset` (strict `== One`, not
+    /// `!= Zero` — matches `state.getPort(RST) == Value.TRUE` exactly,
+    /// unlike `next`'s `!= Zero` check, which matches `state.getPort(NXT)
+    /// != Value.FALSE`) reseeds it. Input order: `ck`, `next`, `reset`
+    /// (`Random`'s own `CK`/`NXT`/`RST`, `OUT` pulled out as the one output
+    /// pin). Deliberately **not** bit-compatible with `java.util.Random`'s
+    /// 48-bit LCG (`StateData`'s `multiplier`/`addend`/`mask`) — ported
+    /// per-decision, not per-gap: replicating that LCG only matters for
+    /// matching a real `java -jar logisim.jar ... -tty table` oracle
+    /// bit-for-bit, and nothing here needs that; `state` instead advances
+    /// via splitmix64 (`memory::splitmix64_step`), a simpler, dependency-
+    /// free PRNG good enough for "looks random, is deterministic, is
+    /// reproducible." Also deliberately diverges from one more Java quirk
+    /// on top of the algorithm itself: Java substitutes a
+    /// `System.currentTimeMillis()`-derived seed whenever the `seed`
+    /// attribute is exactly 0, making a default-seeded `Random` non-
+    /// reproducible between runs — here `seed == 0` is just an ordinary
+    /// seed like any other, since reproducible `.ctest`/golden-test runs
+    /// are the entire point of keeping this component around at all (the
+    /// original reason it was deferred, PLAN.md §14). `reset`'s initial
+    /// `value` mirrors `StateData.reset`'s own pre-first-`step` behavior:
+    /// the seed itself (masked to `bits`), not yet run through `step` once.
+    Random { bits: u8, seed: u32, trigger: Trigger, state: u64, value: u32, last_clock: Bit },
+    /// `std/io/DotMatrix.java`: a pure sink (no output pins) — a
+    /// `rows`x`cols` grid of dots, each driven via one of three wiring
+    /// conventions (`ATTR_INPUT_TYPE`, `io::DotMatrixInput`): `Column` (one
+    /// `rows`-wide input per column), `Row` (one `cols`-wide input per
+    /// row), or `Select` (row-select vector + col-data vector, always 2
+    /// ports here — `cols`-wide col data then `rows`-wide row select,
+    /// matching `updatePorts`'s general `rows>1 && cols>1` shape; the
+    /// degenerate single-row/single-column `Select` case, where real
+    /// Logisim instead exposes only 1 port and its own `propagate` would
+    /// throw reading a nonexistent second port, isn't replicated — see
+    /// `io::set_select`). `grid[row*cols+col]` is row-major, row 0 = top
+    /// (matches `paintInstance`'s `j=0` at the top edge); bit-index
+    /// conventions for each input mode are non-obvious and documented on
+    /// `io::set_row`/`set_column`/`set_select` themselves, ported line-by-
+    /// line from `DotMatrix.State`. `persist` (after-glow: a cell that
+    /// turns off keeps *reading* as on for a few more ticks) is
+    /// deliberately not modeled — it only ever feeds `paintInstance`'s
+    /// animation in the original (no output pins to affect), so `get`
+    /// always reflects the live driven bit, never a simulated decay
+    /// (documented gap, PLAN.md §14-style — not a blocker, same spirit as
+    /// `Probe`'s net-width inference or `PullResistor`'s fixed 1-bit
+    /// width).
+    DotMatrix { rows: u8, cols: u8, input: io::DotMatrixInput, grid: Signal },
+    /// `std/io/Tty.java`: a pure sink (no output pins) — a `rows`x`cols`
+    /// scrolling character display, fed one 7-bit character at a time on
+    /// `in`, gated by `clear`/`ck`/`we` (input order: `clear`, `ck`, `we`,
+    /// `in` — matches `Tty`'s own `CLR`/`CK`/`WE`/`IN` port order). A
+    /// character is accepted on `trigger`'s edge (`Trigger::Rising`/
+    /// `Falling` only — `Tty` uses `StdAttr.EDGE_TRIGGER`, not the 4-option
+    /// `StdAttr.TRIGGER`, so `High`/`Low` never occur here) while `we !=
+    /// Zero`; `clear == One` wins outright regardless of the clock (same
+    /// precedence as `TtyState`'s own `if (clear)... else if (enable)...`).
+    /// A not-fully-defined `in` is stored as `'?'`, not ignored — Java's own
+    /// placeholder, verified in `Tty.propagate`. Ported from `TtyState`:
+    /// `''` (form feed) clears everything and resets the cursor to
+    /// row 0; `'\b'` erases the last character of the in-progress row;
+    /// `'\n'`/`'\r'` commits the in-progress row and moves to the next
+    /// (scrolling the oldest row out once `rows` is full, `TtyState.
+    /// commit`'s own shift); any other non-control character appends,
+    /// auto-committing first if the row is already `cols` long. `rows`/
+    /// `cols` are fixed at construction (unlike Java, which supports live
+    /// attribute-resize via `updateSize` — not modeled, since nothing in
+    /// this engine's own compile model changes a component's attributes
+    /// after compile time, same non-issue as `DotMatrix`'s own "TODO
+    /// repropagate when rows/cols change"). No `sendToStdout`/`-tty table`
+    /// plumbing here — that's an `engine-cli` concern layered on top of
+    /// `read`, not part of the component itself.
+    Tty { cols: u8, rows: u8, trigger: Trigger, last_clock: Bit, row_data: Vec<Vec<char>>, last_row: Vec<char>, row: usize },
+    /// `std/io/Keyboard.java`: a typeahead queue — `clear`/`ck`/`re` gate a
+    /// `dequeue`, `avl`/`out` report whether a character's ready and what
+    /// it is (input order: `clear`, `ck`, `re`; output order: `avl`, `out`
+    /// — matches `Keyboard`'s own `CLR`/`CK`/`RE`/`AVL`/`OUT` port order).
+    /// External input arrives only through `invoke` (`"key"`/`"delete"`/
+    /// `"left"`/`"right"`/`"home"`/`"end"`) — real Logisim wires this to
+    /// Swing key events on the canvas editor (`Keyboard.Poker`), which has
+    /// no equivalent here; `invoke` is this engine's existing external-
+    /// stimulus mechanism for exactly this (same pattern as `Gate::
+    /// InputPin`'s `"set"`/`"on"`/`"off"`/`"toggle"`), not a new concept
+    /// introduced for this gate. Same edge/clear precedence and
+    /// `KeyboardData.dequeue`'s `'\0'` ("nothing ready") sentinel as Java;
+    /// `out` always reports the front-of-queue character masked to 7 bits
+    /// (`c & 0x7F`) regardless of `avl`, matching `Value.createKnown(.., c
+    /// & 0x7F)` unconditionally, not gated by availability. Display-only
+    /// state (`KeyboardData`'s cursor-scrolling `dispStart`/`dispEnd`
+    /// window, `getNextSpecial`'s glyph markers) isn't modeled — it only
+    /// ever fed `paintInstance`'s truncated-view rendering, nothing a
+    /// `.ctest` or downstream gate can observe; the underlying queue/cursor
+    /// *data* (`insert`/`delete`/`moveCursorBy`/`setCursor`/`dequeue`) is
+    /// the real state and is modeled in full.
+    Keyboard { capacity: u16, trigger: Trigger, last_clock: Bit, buffer: Vec<char>, cursor: usize },
 }
 
 /// One input pin's bit `i`, or `Unknown` if that pin is unconnected/narrower
@@ -379,6 +477,19 @@ impl Gate {
             // matching how much slower real multiply/divide hardware is
             // than a plain adder.
             Gate::Multiplier { bits } | Gate::Divider { bits } => *bits as u64 * (*bits as u64 + 2),
+            // Literal `4` in `Random.propagate`'s own `state.setPort(OUT,
+            // val, 4)` — not a named shared constant in the Java source.
+            Gate::Random { .. } => 4,
+            // Pure sinks (no output pins at all) — never actually consulted.
+            Gate::DotMatrix { .. } | Gate::Tty { .. } => 0,
+            // `Keyboard.propagate` actually uses two different delays for
+            // its two outputs (`DELAY0=9` for `OUT`, `DELAY1=11` for
+            // `AVL`) — this engine's delay model is per-*gate*, not per-
+            // output-pin (same granularity `Register`/`Adder` already
+            // live with), so both share `DELAY0`; harmless, since the
+            // only thing that actually depends on this is "delay >= 1",
+            // not the exact relative skew between the two pins.
+            Gate::Keyboard { .. } => 9,
         }
     }
 
@@ -403,7 +514,7 @@ impl Gate {
     /// defined).
     pub fn input_width(&self, pin: usize) -> u8 {
         match self {
-            Gate::Clock { .. } | Gate::Register { .. } | Gate::Rom { .. } | Gate::Ram { .. } => self.input_width_memory(pin),
+            Gate::Clock { .. } | Gate::Register { .. } | Gate::Rom { .. } | Gate::Ram { .. } | Gate::Random { .. } => self.input_width_memory(pin),
             Gate::Constant { .. }
             | Gate::InputPin { .. }
             | Gate::OutputPin { .. }
@@ -413,6 +524,7 @@ impl Gate {
             | Gate::HexDigit { .. } => self.input_width_wiring(pin),
             Gate::Mux { .. } | Gate::Demux { .. } | Gate::Decoder { .. } | Gate::PriorityEncoder { .. } => self.input_width_plexers(pin),
             Gate::Adder { .. } | Gate::Subtractor { .. } | Gate::Comparator { .. } | Gate::Multiplier { .. } | Gate::Divider { .. } => self.input_width_arithmetic(pin),
+            Gate::DotMatrix { .. } | Gate::Tty { .. } | Gate::Keyboard { .. } => self.input_width_io(pin),
             _ => self.input_width_logic(pin),
         }
     }
@@ -422,7 +534,7 @@ impl Gate {
     /// `fanout` entries.
     pub fn output_width(&self, pin: usize) -> u8 {
         match self {
-            Gate::Clock { .. } | Gate::Register { .. } | Gate::Rom { .. } | Gate::Ram { .. } => self.output_width_memory(pin),
+            Gate::Clock { .. } | Gate::Register { .. } | Gate::Rom { .. } | Gate::Ram { .. } | Gate::Random { .. } => self.output_width_memory(pin),
             Gate::Constant { .. }
             | Gate::InputPin { .. }
             | Gate::OutputPin { .. }
@@ -432,6 +544,7 @@ impl Gate {
             | Gate::HexDigit { .. } => self.output_width_wiring(pin),
             Gate::Mux { .. } | Gate::Demux { .. } | Gate::Decoder { .. } | Gate::PriorityEncoder { .. } => self.output_width_plexers(pin),
             Gate::Adder { .. } | Gate::Subtractor { .. } | Gate::Comparator { .. } | Gate::Multiplier { .. } | Gate::Divider { .. } => self.output_width_arithmetic(pin),
+            Gate::Keyboard { .. } => self.output_width_io(pin),
             _ => self.output_width_logic(pin),
         }
     }
@@ -440,8 +553,9 @@ impl Gate {
 impl Component for Gate {
     fn init(&mut self) {
         match self {
-            Gate::Clock { .. } | Gate::Register { .. } | Gate::Rom { .. } | Gate::Ram { .. } => self.init_memory(),
+            Gate::Clock { .. } | Gate::Register { .. } | Gate::Rom { .. } | Gate::Ram { .. } | Gate::Random { .. } => self.init_memory(),
             Gate::Constant { .. } | Gate::InputPin { .. } | Gate::OutputPin { .. } | Gate::PullResistor { .. } | Gate::HexDigit { .. } => self.init_wiring(),
+            Gate::DotMatrix { .. } | Gate::Tty { .. } | Gate::Keyboard { .. } => self.init_io(),
             // Logic gates carry no runtime state to reset — fixed at
             // instantiation (an attribute in Logisim terms), never
             // simulated state.
@@ -451,7 +565,7 @@ impl Component for Gate {
 
     fn input_count(&self) -> usize {
         match self {
-            Gate::Clock { .. } | Gate::Register { .. } | Gate::Rom { .. } | Gate::Ram { .. } => self.input_count_memory(),
+            Gate::Clock { .. } | Gate::Register { .. } | Gate::Rom { .. } | Gate::Ram { .. } | Gate::Random { .. } => self.input_count_memory(),
             Gate::Constant { .. }
             | Gate::InputPin { .. }
             | Gate::OutputPin { .. }
@@ -461,26 +575,28 @@ impl Component for Gate {
             | Gate::HexDigit { .. } => self.input_count_wiring(),
             Gate::Mux { .. } | Gate::Demux { .. } | Gate::Decoder { .. } | Gate::PriorityEncoder { .. } => self.input_count_plexers(),
             Gate::Adder { .. } | Gate::Subtractor { .. } | Gate::Comparator { .. } | Gate::Multiplier { .. } | Gate::Divider { .. } => self.input_count_arithmetic(),
+            Gate::DotMatrix { .. } | Gate::Tty { .. } | Gate::Keyboard { .. } => self.input_count_io(),
             _ => self.input_count_logic(),
         }
     }
 
     fn output_count(&self) -> usize {
         match self {
-            Gate::OutputPin { .. } | Gate::HexDigit { .. } => 0,
+            Gate::OutputPin { .. } | Gate::HexDigit { .. } | Gate::DotMatrix { .. } | Gate::Tty { .. } => 0,
             // The only gate kinds with more than one output pin — everything
             // else (including `Mux`) is exactly 1.
             Gate::Demux { select_bits, .. } | Gate::Decoder { select_bits, .. } => 1usize << select_bits,
             Gate::Adder { .. } | Gate::Subtractor { .. } | Gate::Multiplier { .. } | Gate::Divider { .. } => 2, // sum/diff, carry/borrow-out
             Gate::Comparator { .. } => 3,                      // gt, eq, lt
             Gate::PriorityEncoder { .. } => 3,                 // out, enable_out, group_signal
+            Gate::Keyboard { .. } => 2,                        // avl, out
             _ => 1,
         }
     }
 
     fn eval(&mut self, inputs: &[Signal]) -> Vec<Signal> {
         match self {
-            Gate::Clock { .. } | Gate::Register { .. } | Gate::Rom { .. } | Gate::Ram { .. } => self.eval_memory(inputs),
+            Gate::Clock { .. } | Gate::Register { .. } | Gate::Rom { .. } | Gate::Ram { .. } | Gate::Random { .. } => self.eval_memory(inputs),
             Gate::Constant { .. }
             | Gate::InputPin { .. }
             | Gate::OutputPin { .. }
@@ -490,14 +606,16 @@ impl Component for Gate {
             | Gate::HexDigit { .. } => self.eval_wiring(inputs),
             Gate::Mux { .. } | Gate::Demux { .. } | Gate::Decoder { .. } | Gate::PriorityEncoder { .. } => self.eval_plexers(inputs),
             Gate::Adder { .. } | Gate::Subtractor { .. } | Gate::Comparator { .. } | Gate::Multiplier { .. } | Gate::Divider { .. } => self.eval_arithmetic(inputs),
+            Gate::DotMatrix { .. } | Gate::Tty { .. } | Gate::Keyboard { .. } => self.eval_io(inputs),
             _ => self.eval_logic(inputs),
         }
     }
 
     fn serialize_state(&self) -> Vec<u8> {
         match self {
-            Gate::Clock { .. } | Gate::Register { .. } | Gate::Rom { .. } | Gate::Ram { .. } => self.serialize_memory(),
+            Gate::Clock { .. } | Gate::Register { .. } | Gate::Rom { .. } | Gate::Ram { .. } | Gate::Random { .. } => self.serialize_memory(),
             Gate::InputPin { .. } | Gate::OutputPin { .. } | Gate::HexDigit { .. } => self.serialize_wiring(),
+            Gate::DotMatrix { .. } | Gate::Tty { .. } | Gate::Keyboard { .. } => self.serialize_io(),
             // Configuration, not runtime state — nothing to persist.
             _ => Vec::new(),
         }
@@ -505,8 +623,9 @@ impl Component for Gate {
 
     fn deserialize_state(&mut self, state: &[u8]) {
         match self {
-            Gate::Clock { .. } | Gate::Register { .. } | Gate::Rom { .. } | Gate::Ram { .. } => self.deserialize_memory(state),
+            Gate::Clock { .. } | Gate::Register { .. } | Gate::Rom { .. } | Gate::Ram { .. } | Gate::Random { .. } => self.deserialize_memory(state),
             Gate::InputPin { .. } | Gate::OutputPin { .. } | Gate::HexDigit { .. } => self.deserialize_wiring(state),
+            Gate::DotMatrix { .. } | Gate::Tty { .. } | Gate::Keyboard { .. } => self.deserialize_io(state),
             _ => {}
         }
     }
@@ -515,6 +634,7 @@ impl Component for Gate {
         match self {
             Gate::Clock { .. } | Gate::Register { .. } => self.actions_memory(),
             Gate::InputPin { .. } => self.actions_wiring(),
+            Gate::Keyboard { .. } => self.actions_io(),
             _ => Vec::new(),
         }
     }
@@ -523,21 +643,24 @@ impl Component for Gate {
         match self {
             Gate::Clock { .. } | Gate::Register { .. } => self.invoke_memory(name, arg),
             Gate::InputPin { .. } => self.invoke_wiring(name, arg),
+            Gate::Keyboard { .. } => self.invoke_io(name, arg),
             _ => Err(ActionError::UnknownAction(name.to_string())),
         }
     }
 
     fn readouts(&self) -> Vec<&'static str> {
         match self {
-            Gate::InputPin { .. } | Gate::OutputPin { .. } | Gate::Clock { .. } | Gate::Register { .. } | Gate::HexDigit { .. } => vec!["get"],
+            Gate::InputPin { .. } | Gate::OutputPin { .. } | Gate::Clock { .. } | Gate::Register { .. } | Gate::HexDigit { .. } | Gate::Random { .. } => vec!["get"],
+            Gate::DotMatrix { .. } | Gate::Tty { .. } | Gate::Keyboard { .. } => self.readouts_io(),
             _ => Vec::new(),
         }
     }
 
     fn read(&self, name: &str) -> Result<Value, ReadoutError> {
         match self {
-            Gate::Clock { .. } | Gate::Register { .. } => self.read_memory(name),
+            Gate::Clock { .. } | Gate::Register { .. } | Gate::Random { .. } => self.read_memory(name),
             Gate::InputPin { .. } | Gate::OutputPin { .. } | Gate::HexDigit { .. } => self.read_wiring(name),
+            Gate::DotMatrix { .. } | Gate::Tty { .. } | Gate::Keyboard { .. } => self.read_io(name),
             _ => Err(ReadoutError::UnknownReadout(name.to_string())),
         }
     }

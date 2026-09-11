@@ -111,6 +111,20 @@ fn ram_bus_attr(circuit: &Circuit, comp: &ComponentInstance) -> Result<RamBus, C
     }
 }
 
+/// `attrs["seed"]` for `core:Random` — `Random.ATTR_SEED`'s own name and
+/// type (a plain `Integer`, any value including 0 — see `Gate::Random`'s
+/// doc comment for why `0` isn't special-cased into a time-based seed the
+/// way Java's own `StateData.reset` does).
+fn random_seed_attr(comp: &ComponentInstance) -> u32 {
+    comp.attrs.get("seed").and_then(|v| v.as_i64()).unwrap_or(0) as u32
+}
+
+/// `ck`, `next`, `reset` — matches `Gate::Random`'s expected input order;
+/// one output, `out`.
+fn random_geometry() -> Geometry {
+    Geometry { inputs: vec![(0, 0), (0, 2), (0, 4)], outputs: vec![(2, 0)] }
+}
+
 /// `addr`, `cs` -> `data` — matches `Gate::Rom`'s expected input order.
 fn rom_geometry() -> Geometry {
     Geometry { inputs: vec![(0, 0), (0, -2)], outputs: vec![(2, 0)] }
@@ -160,6 +174,15 @@ pub(super) fn compile(type_: &str, circuit: &Circuit, comp: &ComponentInstance) 
             let data_bits = data_width_attr(circuit, comp)?;
             let bus = ram_bus_attr(circuit, comp)?;
             Ok((TemplateNode::Ram { addr_bits, data_bits, bus }, ram_geometry(bus)))
+        })(),
+        "core:Random" => (|| {
+            let bits = width_attr(circuit, comp)?;
+            let seed = random_seed_attr(comp);
+            // `Random` uses `StdAttr.EDGE_TRIGGER` (2-option), not this
+            // module's own 4-option `trigger_attr` — see `io::
+            // edge_trigger_attr`'s doc comment for why.
+            let trigger = super::io::edge_trigger_attr(circuit, comp)?;
+            Ok((TemplateNode::Random { bits, seed, trigger }, random_geometry()))
         })(),
         _ => return None,
     };
@@ -362,5 +385,36 @@ mod tests {
         sim.invoke(2, "on", None).unwrap(); // oe = 1: ram switches to read mode
         sim.run_to_quiescence();
         assert_eq!(get_bits(&sim, 9), vec![Bit::Zero, Bit::One, Bit::Zero, Bit::One], "reads back what was written");
+    }
+
+    /// `Random` wired end to end: before any clock edge, `out` reads the
+    /// seed itself (unmasked by `java.util.Random`'s LCG, see `Gate::
+    /// Random`'s doc comment) — not a specific post-step value, since this
+    /// port deliberately isn't bit-compatible with Java's algorithm.
+    #[test]
+    fn compiles_and_simulates_a_random_reading_its_raw_seed_before_any_step() {
+        let mut attrs = BTreeMap::new();
+        attrs.insert("width".to_string(), json!(8));
+        attrs.insert("seed".to_string(), json!(99));
+
+        let project = single_circuit_project(Circuit {
+            name: "main".to_string(),
+            components: vec![
+                comp("ck", "core:InputPin", 0, 0),
+                comp("next", "core:InputPin", 0, 2),
+                comp("reset", "core:InputPin", 0, 4),
+                ComponentInstance { attrs, ..comp("r", "core:Random", 0, 0) },
+                ComponentInstance { attrs: { let mut a = BTreeMap::new(); a.insert("width".to_string(), json!(8)); a }, ..comp("out", "core:OutputPin", 2, 0) },
+            ],
+            wires: vec![wire("w0", [0, 0], [0, 0]), wire("w1", [0, 2], [0, 2]), wire("w2", [0, 4], [0, 4]), wire("w3", [2, 0], [2, 0])],
+            annotations: vec![],
+        });
+
+        let library = compile(&project).unwrap();
+        let netlist = flatten(&project.main_circuit, &library).unwrap();
+        let mut sim = Simulation::new(netlist);
+        sim.run_to_quiescence();
+        // Node order: ck=0, next=1, reset=2, r=3, out=4.
+        assert_eq!(get_bits(&sim, 4), vec![Bit::One, Bit::One, Bit::Zero, Bit::Zero, Bit::Zero, Bit::One, Bit::One, Bit::Zero], "99 = 0b01100011");
     }
 }

@@ -30,7 +30,7 @@ impl Trigger {
     /// Mirrors `ClockState.updateClock`: `old`/`new` must be *exactly*
     /// `Zero`/`One` for an edge to count — an `Unknown`/`Error` clock input
     /// never counts as "was low" or "is high".
-    fn fired(self, old: Bit, new: Bit) -> bool {
+    pub(super) fn fired(self, old: Bit, new: Bit) -> bool {
         match self {
             Trigger::Rising => old == Bit::Zero && new == Bit::One,
             Trigger::Falling => old == Bit::One && new == Bit::Zero,
@@ -38,6 +38,20 @@ impl Trigger {
             Trigger::Low => new == Bit::Zero,
         }
     }
+}
+
+/// `StateData`'s 64-bit splitmix64 stepping function — deliberately not
+/// `java.util.Random`'s own 48-bit LCG, see `Gate::Random`'s doc comment
+/// for why. Advances `state` and returns the next output word (the low 32
+/// bits of a full 64-bit splitmix64 output — plenty for this gate's
+/// `bits <= 32` ceiling).
+fn splitmix64_step(state: &mut u64) -> u32 {
+    *state = state.wrapping_add(0x9E3779B97F4A7C15);
+    let mut z = *state;
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58476D1CE4E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D049BB133111EB);
+    z ^= z >> 31;
+    z as u32
 }
 
 impl Gate {
@@ -50,6 +64,15 @@ impl Gate {
             Gate::Register { value, last_clock, .. } => {
                 *value = 0;
                 *last_clock = Bit::Zero; // matches memory `ClockState`'s initial `Value.FALSE`
+            }
+            // `StateData extends ClockState`: same `Value.FALSE` initial
+            // `lastClock` as `Register`/`Clock`. `state`/`value` mirror
+            // `StateData`'s constructor, which calls `reset(seed)`
+            // immediately — the seed itself, not yet stepped once.
+            Gate::Random { seed, state, value, last_clock, .. } => {
+                *state = *seed as u64;
+                *value = *seed;
+                *last_clock = Bit::Zero;
             }
             // `contents` is fixed configuration (an attribute in Logisim
             // terms, loaded from `"contents"` at compile time), not
@@ -86,6 +109,8 @@ impl Gate {
             // this shape; `data_in` senses the bidirectional bus itself
             // (there's no separate write pin without `Separate`).
             Gate::Ram { .. } => 6,
+            // ck, next, reset — `OUT` pulled out as the one output pin.
+            Gate::Random { .. } => 3,
             _ => unreachable!("dispatch bug: not a memory gate"),
         }
     }
@@ -109,6 +134,8 @@ impl Gate {
                 5 => *data_bits,                    // data_in (combined/asynch)
                 _ => *data_bits,                    // din (separate, pin 6)
             },
+            // ck, next, reset — all 1-bit.
+            Gate::Random { .. } => 1,
             _ => unreachable!("dispatch bug: not a memory gate with inputs"),
         }
     }
@@ -118,6 +145,7 @@ impl Gate {
             Gate::Clock { .. } => 1,
             Gate::Register { bits, .. } => *bits,
             Gate::Rom { data_bits, .. } | Gate::Ram { data_bits, .. } => *data_bits,
+            Gate::Random { bits, .. } => *bits,
             _ => unreachable!("dispatch bug: not a memory gate"),
         }
     }
@@ -219,6 +247,27 @@ impl Gate {
                     if output_enabled { u32_to_signal(contents[addr as usize], *data_bits) } else { vec![Bit::Unknown; *data_bits as usize] };
                 vec![held_data.clone()]
             }
+            Gate::Random { bits, seed, trigger, state, value, last_clock } => {
+                let ck = bit_at(&inputs[0], 0);
+                let next = bit_at(&inputs[1], 0);
+                let reset = bit_at(&inputs[2], 0);
+
+                let triggered = trigger.fired(*last_clock, ck);
+                *last_clock = ck;
+
+                // `state.getPort(RST) == Value.TRUE` — strict equality,
+                // unlike `next`'s `!= Value.FALSE` below (verified in
+                // `Random.propagate`). Reseeding mirrors `StateData.reset`:
+                // the seed itself, not yet stepped once (same as `init`).
+                if reset == Bit::One {
+                    *state = *seed as u64;
+                    *value = *seed;
+                } else if triggered && next != Bit::Zero {
+                    *value = splitmix64_step(state);
+                }
+
+                vec![u32_to_signal(*value, *bits)]
+            }
             _ => unreachable!("dispatch bug: not a memory gate"),
         }
     }
@@ -243,6 +292,12 @@ impl Gate {
             Gate::Ram { contents, held_data, last_clock, .. } => {
                 let mut out: Vec<u8> = contents.iter().flat_map(|v| v.to_le_bytes()).collect();
                 out.extend(held_data.iter().copied().map(bit_to_byte));
+                out.push(bit_to_byte(*last_clock));
+                out
+            }
+            Gate::Random { state, value, last_clock, .. } => {
+                let mut out = state.to_le_bytes().to_vec();
+                out.extend(value.to_le_bytes());
                 out.push(bit_to_byte(*last_clock));
                 out
             }
@@ -276,6 +331,14 @@ impl Gate {
                 let held_off = contents.len() * 4;
                 *held_data = (0..*data_bits as usize).map(|i| state.get(held_off + i).copied().map(byte_to_bit).unwrap_or(Bit::Zero)).collect();
                 *last_clock = state.get(held_off + *data_bits as usize).copied().map(byte_to_bit).unwrap_or(Bit::Zero);
+            }
+            // Destructured as `rng_state`, not `state` — the field would
+            // otherwise shadow this function's own `state: &[u8]`
+            // parameter for the rest of the arm.
+            Gate::Random { state: rng_state, value, last_clock, .. } => {
+                *rng_state = state.get(0..8).and_then(|b| b.try_into().ok()).map(u64::from_le_bytes).unwrap_or(0);
+                *value = state.get(8..12).and_then(|b| b.try_into().ok()).map(u32::from_le_bytes).unwrap_or(0);
+                *last_clock = state.get(12).copied().map(byte_to_bit).unwrap_or(Bit::Zero);
             }
             _ => unreachable!("dispatch bug: not a memory gate"),
         }
@@ -325,7 +388,8 @@ impl Gate {
         match self {
             Gate::Clock { sending, .. } if name == "get" => Ok(Value::Bits(vec![*sending])),
             Gate::Register { bits, value, .. } if name == "get" => Ok(Value::Bits(u32_to_signal(*value, *bits))),
-            Gate::Clock { .. } | Gate::Register { .. } => Err(ReadoutError::UnknownReadout(name.to_string())),
+            Gate::Random { bits, value, .. } if name == "get" => Ok(Value::Bits(u32_to_signal(*value, *bits))),
+            Gate::Clock { .. } | Gate::Register { .. } | Gate::Random { .. } => Err(ReadoutError::UnknownReadout(name.to_string())),
             _ => unreachable!("dispatch bug: not a memory gate"),
         }
     }
@@ -679,5 +743,73 @@ mod tests {
 
         let out = r.eval(&ram_separate_inputs(&addr, Bit::One, Bit::One, Bit::Zero, Bit::One, Bit::Zero, &zeros(4)));
         assert_eq!(out, vec![zeros(4)], "we=0 must not have written");
+    }
+
+    fn random(bits: u8, seed: u32) -> Gate {
+        let mut g = Gate::Random { bits, seed, trigger: Trigger::Rising, state: 0, value: 0, last_clock: Bit::One };
+        g.init();
+        g
+    }
+
+    // [ck, next, reset]
+    fn random_inputs(ck: Bit, next: Bit, reset: Bit) -> Vec<Signal> {
+        vec![vec![ck], vec![next], vec![reset]]
+    }
+
+    /// Before any clock edge, `out` reflects the seed itself (masked to
+    /// `bits`), not a stepped value — `StateData.reset`'s own pre-first-
+    /// `step` behavior (`value = (int) start`).
+    #[test]
+    fn random_starts_at_the_raw_seed_before_any_step() {
+        let mut r = random(8, 0xAB);
+        let out = r.eval(&random_inputs(Bit::Zero, Bit::Zero, Bit::Zero));
+        assert_eq!(out, vec![u32_to_signal(0xAB, 8)]);
+    }
+
+    /// `seed == 0` is an ordinary seed here (unlike Java's time-based
+    /// substitution) — two independently constructed `Random`s with the
+    /// same seed must produce the exact same sequence, the whole point of
+    /// dropping Java's non-reproducible fallback.
+    #[test]
+    fn random_is_deterministic_and_reproducible_across_instances_even_with_seed_zero() {
+        let mut a = random(16, 0);
+        let mut b = random(16, 0);
+        let step = |g: &mut Gate, ck: Bit| g.eval(&random_inputs(ck, Bit::One, Bit::Zero))[0].clone();
+        for ck in [Bit::One, Bit::Zero, Bit::One, Bit::Zero, Bit::One] {
+            assert_eq!(step(&mut a, ck), step(&mut b, ck));
+        }
+    }
+
+    /// `next` only advances `value` on `trigger`'s edge, not on every
+    /// `eval` — re-reading with `next` still high but no new edge must not
+    /// change `value` again.
+    #[test]
+    fn random_next_only_steps_on_a_rising_edge_not_on_every_eval() {
+        let mut r = random(16, 42);
+        let after_edge = r.eval(&random_inputs(Bit::One, Bit::One, Bit::Zero))[0].clone();
+        let held = r.eval(&random_inputs(Bit::One, Bit::One, Bit::Zero))[0].clone();
+        assert_eq!(after_edge, held, "no new edge since the last eval");
+    }
+
+    /// `reset == One` reseeds to the configured seed (strict `== One`,
+    /// verified — unlike `next`'s `!= Zero`), regardless of `next`/clock.
+    #[test]
+    fn random_reset_reseeds_to_the_configured_seed() {
+        let mut r = random(16, 7);
+        r.eval(&random_inputs(Bit::One, Bit::One, Bit::Zero)); // step away from the seed
+        let stepped = r.eval(&random_inputs(Bit::Zero, Bit::One, Bit::Zero))[0].clone();
+        assert_ne!(stepped, u32_to_signal(7, 16), "sanity: it actually moved");
+
+        let out = r.eval(&random_inputs(Bit::Zero, Bit::One, Bit::One));
+        assert_eq!(out, vec![u32_to_signal(7, 16)]);
+    }
+
+    /// An `Unknown`/`Error` `reset` must not reseed — only an exact `One`
+    /// does (`state.getPort(RST) == Value.TRUE`, not `!= Value.FALSE`).
+    #[test]
+    fn random_undefined_reset_does_not_reseed() {
+        let mut r = random(16, 7);
+        let out = r.eval(&random_inputs(Bit::Zero, Bit::Zero, Bit::Unknown));
+        assert_eq!(out, vec![u32_to_signal(7, 16)], "still at the seed, but not because reset fired");
     }
 }

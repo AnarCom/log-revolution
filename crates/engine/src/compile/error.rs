@@ -52,4 +52,18 @@ pub enum CompileError {
     /// `attrs["type"]` for `core:Transistor` isn't one of `Transistor.java`'s
     /// own two option strings (`"p"`/`"n"`).
     InvalidTransistorType { circuit: String, id: String, value: String },
+    /// `attrs["matrixcols"]`/`attrs["matrixrows"]` for `core:DotMatrix`
+    /// outside 1..=32 (`DotMatrix.ATTR_MATRIX_COLS`/`ATTR_MATRIX_ROWS`'s
+    /// own range, `1, Value.MAX_WIDTH`).
+    InvalidDotMatrixSize { circuit: String, id: String, field: &'static str, value: i64 },
+    /// `attrs["inputtype"]` for `core:DotMatrix` isn't one of `DotMatrix.
+    /// ATTR_INPUT_TYPE`'s own three option strings (`"column"`/`"row"`/
+    /// `"select"`).
+    InvalidDotMatrixInput { circuit: String, id: String, value: String },
+    /// `attrs["cols"]`/`attrs["rows"]` for `core:Tty` outside `Tty.
+    /// ATTR_COLUMNS`/`ATTR_ROWS`'s own ranges (1..=120, 1..=48).
+    InvalidTtyDimension { circuit: String, id: String, field: &'static str, value: i64 },
+    /// `attrs["buflen"]` for `core:Keyboard` outside 1..=256 (`Keyboard.
+    /// ATTR_BUFFER`'s own range).
+    InvalidKeyboardBufferLength { circuit: String, id: String, value: i64 },
 }

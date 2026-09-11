@@ -67,6 +67,7 @@ mod arithmetic;
 mod dsu;
 mod error;
 mod geometry;
+mod io;
 mod logic;
 mod memory;
 mod plexers;
@@ -171,6 +172,7 @@ fn compile_leaf(type_: &str, circuit: &Circuit, comp: &ComponentInstance) -> Opt
         .or_else(|| memory::compile(type_, circuit, comp))
         .or_else(|| plexers::compile(type_, circuit, comp))
         .or_else(|| arithmetic::compile(type_, circuit, comp))
+        .or_else(|| io::compile(type_, circuit, comp))
 }
 
 fn compile_circuit(

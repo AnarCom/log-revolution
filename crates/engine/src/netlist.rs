@@ -20,7 +20,7 @@
 //! usable whether or not the circuit they're in is ever used as a
 //! subcircuit.
 
-use crate::components::{ExtendMode, Gate, RamBus, Trigger};
+use crate::components::{DotMatrixInput, ExtendMode, Gate, RamBus, Trigger};
 use plugin_abi::Bit;
 use std::collections::HashMap;
 
@@ -105,6 +105,19 @@ pub enum TemplateNode {
     /// See `Gate::Divider`: inputs `in0`, `in1`, `upper`; outputs `out`,
     /// `rem` (every pin `bits`-wide).
     Divider { bits: u8 },
+    /// See `Gate::Random`: input order is `ck`, `next`, `reset`; one
+    /// output, `out`.
+    Random { bits: u8, seed: u32, trigger: Trigger },
+    /// See `Gate::DotMatrix`: input order/count depends on `input`
+    /// (`DotMatrixInput::Column`/`Row` -> one input per column/row;
+    /// `Select` -> always 2, `col_data` then `row_select`); no outputs.
+    DotMatrix { rows: u8, cols: u8, input: DotMatrixInput },
+    /// See `Gate::Tty`: input order is `clear`, `ck`, `we`, `in`; no
+    /// outputs.
+    Tty { cols: u8, rows: u8, trigger: Trigger },
+    /// See `Gate::Keyboard`: input order is `clear`, `ck`, `re`; output
+    /// order is `avl`, `out`.
+    Keyboard { capacity: u16, trigger: Trigger },
     /// Reference to another `CircuitTemplate` by name, resolved during
     /// `flatten`. As a connection endpoint, its pins are numbered
     /// `0..input_ports.len()` for inputs then `input_ports.len()..` for
@@ -215,6 +228,26 @@ impl TemplateNode {
                 }
             }
             TemplateNode::Comparator { bits, .. } | TemplateNode::Multiplier { bits } | TemplateNode::Divider { bits } => *bits,
+            TemplateNode::Random { .. } => 1, // ck, next, reset
+            TemplateNode::DotMatrix { rows, cols, input } => match input {
+                DotMatrixInput::Column => *rows,
+                DotMatrixInput::Row => *cols,
+                DotMatrixInput::Select => {
+                    if pin == 0 {
+                        *cols
+                    } else {
+                        *rows
+                    }
+                }
+            },
+            TemplateNode::Tty { .. } => {
+                if pin == 3 {
+                    7
+                } else {
+                    1
+                }
+            }
+            TemplateNode::Keyboard { .. } => 1,
             TemplateNode::Constant { .. }
             | TemplateNode::InputPin { .. }
             | TemplateNode::PullResistor(_)
@@ -261,8 +294,18 @@ impl TemplateNode {
             }
             TemplateNode::Comparator { .. } => 1,
             TemplateNode::Multiplier { bits } | TemplateNode::Divider { bits } => *bits,
+            TemplateNode::Random { bits, .. } => *bits,
+            TemplateNode::Keyboard { .. } => {
+                if pin == 0 {
+                    1
+                } else {
+                    7
+                }
+            }
             TemplateNode::OutputPin { .. } => unreachable!("OutputPin has no output pins"),
             TemplateNode::HexDigit => unreachable!("HexDigit has no output pins"),
+            TemplateNode::DotMatrix { .. } => unreachable!("DotMatrix has no output pins"),
+            TemplateNode::Tty { .. } => unreachable!("Tty has no output pins"),
             TemplateNode::Subcircuit(_) => unreachable!("Subcircuit width is resolved via the port-width table"),
         }
     }
@@ -561,6 +604,45 @@ fn expand(
             }
             TemplateNode::Divider { bits } => {
                 local_to_global.insert(local_idx, builder.add_gate(Gate::Divider { bits: *bits }));
+            }
+            TemplateNode::Random { bits, seed, trigger } => {
+                local_to_global.insert(
+                    local_idx,
+                    // `state`/`value`/`last_clock` are overwritten by
+                    // `Gate::init` (`init_memory`'s `Random` arm) before
+                    // any real simulation happens — `Simulation::new`
+                    // never calls `init` itself, but nothing that matters
+                    // here depends on it either, since `reset(seed)`'s own
+                    // effect (`state = seed`, `value = seed`) is exactly
+                    // what's written here directly.
+                    builder.add_gate(Gate::Random { bits: *bits, seed: *seed, trigger: *trigger, state: *seed as u64, value: *seed, last_clock: Bit::Zero }),
+                );
+            }
+            TemplateNode::DotMatrix { rows, cols, input } => {
+                local_to_global.insert(
+                    local_idx,
+                    builder.add_gate(Gate::DotMatrix { rows: *rows, cols: *cols, input: *input, grid: vec![Bit::Unknown; *rows as usize * *cols as usize] }),
+                );
+            }
+            TemplateNode::Tty { cols, rows, trigger } => {
+                local_to_global.insert(
+                    local_idx,
+                    builder.add_gate(Gate::Tty {
+                        cols: *cols,
+                        rows: *rows,
+                        trigger: *trigger,
+                        last_clock: Bit::Unknown,
+                        row_data: vec![Vec::new(); (*rows as usize).saturating_sub(1)],
+                        last_row: Vec::new(),
+                        row: 0,
+                    }),
+                );
+            }
+            TemplateNode::Keyboard { capacity, trigger } => {
+                local_to_global.insert(
+                    local_idx,
+                    builder.add_gate(Gate::Keyboard { capacity: *capacity, trigger: *trigger, last_clock: Bit::Unknown, buffer: Vec::new(), cursor: 0 }),
+                );
             }
             TemplateNode::Subcircuit(sub_name) => {
                 let (ports, _) = expand(sub_name, library, builder, stack, false)?;
